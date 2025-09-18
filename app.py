@@ -193,6 +193,7 @@ def audio_emotion(p: AudioPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio inference error: {e}")
 
+# ----------------- Chat -----------------
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:
@@ -225,3 +226,11 @@ def chat_reply(p: ChatPayload):
             "reply": "(stub) Sorry, I'm having trouble replying right now.",
             "error": str(e),
         }
+
+# ----------------- Extra GET for debug -----------------
+@app.get("/chat/reply")
+def chat_reply_get():
+    return {
+        "status": "ok",
+        "note": "Use POST with JSON {message, emotion, history} to get a reply."
+    }

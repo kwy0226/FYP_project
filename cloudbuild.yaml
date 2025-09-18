@@ -5,6 +5,17 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   args: ['push', 'asia-southeast1-docker.pkg.dev/$PROJECT_ID/fyp-repo/fyp-app']
 
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args:
+  - run
+  - deploy
+  - fyp-project
+  - --image=asia-southeast1-docker.pkg.dev/$PROJECT_ID/fyp-repo/fyp-app
+  - --region=asia-southeast1
+  - --platform=managed
+  - --allow-unauthenticated
+
 images:
 - 'asia-southeast1-docker.pkg.dev/$PROJECT_ID/fyp-repo/fyp-app'
 

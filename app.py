@@ -330,6 +330,3 @@ def chat_reply(p: ChatPayload):
         return {"reply": reply}
     except Exception as e:
         return {"reply": "(stub) error", "error": str(e)}
-    except Exception as e:
-        return {"reply": "(stub) error", "error": str(e)}
-

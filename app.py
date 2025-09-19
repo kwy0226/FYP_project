@@ -17,7 +17,7 @@ import torchaudio
 # language detection
 from langdetect import detect
 
-# ---------- OpenAI chat ----------
+# ---------- OpenAI ----------
 from openai import OpenAI
 
 # ---------- Firebase ----------
@@ -82,6 +82,7 @@ class ChatPayload(BaseModel):
     aiName: Optional[str] = None
     aiGender: Optional[str] = None
     aiBackground: Optional[str] = None
+    isAnimeCharacter: Optional[bool] = False
     uid: Optional[str] = None
     chatId: Optional[str] = None
     msgId: Optional[str] = None
@@ -155,6 +156,38 @@ def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict)
     ref = db.reference(f"users/{uid}/chats/{chatId}/messages/{msgId}")
     ref.update({"detectedEmotion": emotion})
 
+# --- Anime Profile Helpers ---
+def _write_profile_if_anime(aiName: str, aiBackground: str, uid: str, contribution: str):
+    if not aiName:
+        return
+    ref = db.reference(f"Profile/Anime Character/{aiName}")
+    snap = ref.get()
+    if not snap:
+        ref.set({
+            "background": aiBackground,
+            "contributions": {
+                uid: contribution
+            }
+        })
+    else:
+        if "background" not in snap and aiBackground:
+            ref.update({"background": aiBackground})
+        if contribution:
+            ref.child("contributions").child(uid).set(contribution)
+
+def _load_profile_for_prompt(aiName: str) -> str:
+    ref = db.reference(f"Profile/Anime Character/{aiName}")
+    snap = ref.get()
+    if not snap:
+        return ""
+    bg = snap.get("background", "")
+    contribs = snap.get("contributions", {})
+    contrib_texts = []
+    for uid, text in contribs.items():
+        contrib_texts.append(f"- {text}")
+    contrib_block = "\n".join(contrib_texts)
+    return f"Official background: {bg}\nCommunity impressions:\n{contrib_block}"
+
 # =======================================================
 # Routes
 # =======================================================
@@ -223,10 +256,24 @@ def audio_emotion(p: AudioPayload):
 def chat_reply(p: ChatPayload):
     if not _openai_client:
         return {"reply": "(stub) AI disabled"}
-    
+
+    # --- anime profile handling ---
+    profile_text = ""
+    if p.isAnimeCharacter and p.aiName:
+        _write_profile_if_anime(
+            aiName=p.aiName,
+            aiBackground=p.aiBackground or "",
+            uid=p.uid or "unknown",
+            contribution=p.aiBackground or ""
+        )
+        profile_text = _load_profile_for_prompt(p.aiName)
+
+    # --- build system prompt ---
     sys_prompt = "You are a supportive, empathetic companion."
     if p.aiName:
         sys_prompt += f" You are roleplaying as {p.aiName}."
+    if profile_text:
+        sys_prompt += f"\n{profile_text}"
 
     user_text = p.message
     if p.emotion:
@@ -251,3 +298,4 @@ def chat_reply(p: ChatPayload):
         return {"reply": reply}
     except Exception as e:
         return {"reply": "(stub) error", "error": str(e)}
+

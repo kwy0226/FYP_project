@@ -54,7 +54,7 @@ app = FastAPI(title="Emotion API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dev only
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -156,37 +156,66 @@ def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict)
     ref = db.reference(f"users/{uid}/chats/{chatId}/messages/{msgId}")
     ref.update({"detectedEmotion": emotion})
 
-# --- Anime Profile Helpers ---
-def _write_profile_if_anime(aiName: str, aiBackground: str, uid: str, contribution: str):
+# ----------------- Profile logic -----------------
+def _write_profile(aiName: str, aiBackground: str, uid: str, isAnime: bool):
+    """Store profile into Anime Character (public) or Exclusive Character (private)"""
     if not aiName:
         return
-    ref = db.reference(f"Profile/Anime Character/{aiName}")
-    snap = ref.get()
-    if not snap:
-        ref.set({
-            "background": aiBackground,
-            "contributions": {
-                uid: contribution
-            }
-        })
-    else:
-        if "background" not in snap and aiBackground:
-            ref.update({"background": aiBackground})
-        if contribution:
-            ref.child("contributions").child(uid).set(contribution)
+    now_ts = int(time.time() * 1000)
 
-def _load_profile_for_prompt(aiName: str) -> str:
-    ref = db.reference(f"Profile/Anime Character/{aiName}")
-    snap = ref.get()
-    if not snap:
-        return ""
-    bg = snap.get("background", "")
-    contribs = snap.get("contributions", {})
-    contrib_texts = []
-    for uid, text in contribs.items():
-        contrib_texts.append(f"- {text}")
-    contrib_block = "\n".join(contrib_texts)
-    return f"Official background: {bg}\nCommunity impressions:\n{contrib_block}"
+    if isAnime:
+        ref = db.reference(f"Profile/Anime Character/{aiName}")
+        snap = ref.get()
+        if not snap:
+            ref.set({
+                "baseProfile": aiBackground,
+                "contributions": {
+                    uid: {"text": aiBackground, "lastUpdated": now_ts}
+                },
+                "lastUpdated": now_ts
+            })
+        else:
+            updates = {"lastUpdated": now_ts}
+            if aiBackground and "baseProfile" not in snap:
+                updates["baseProfile"] = aiBackground
+            if aiBackground:
+                ref.child("contributions").child(uid).update({
+                    "text": aiBackground,
+                    "lastUpdated": now_ts
+                })
+            ref.update(updates)
+    else:
+        ref = db.reference(f"Profile/Exclusive Character/{uid}/{aiName}")
+        snap = ref.get()
+        if not snap:
+            ref.set({
+                "baseProfile": aiBackground,
+                "lastUpdated": now_ts
+            })
+        else:
+            updates = {"lastUpdated": now_ts}
+            if aiBackground:
+                updates["baseProfile"] = aiBackground
+            ref.update(updates)
+
+def _load_profile(aiName: str, uid: str, isAnime: bool) -> str:
+    """Load profile text for system prompt"""
+    if isAnime:
+        ref = db.reference(f"Profile/Anime Character/{aiName}")
+        snap = ref.get()
+        if not snap:
+            return ""
+        bg = snap.get("baseProfile", "")
+        contribs = snap.get("contributions", {})
+        contrib_texts = [f"- {v['text']}" for v in contribs.values() if isinstance(v, dict) and "text" in v]
+        contrib_block = "\n".join(contrib_texts)
+        return f"Official background: {bg}\nCommunity impressions:\n{contrib_block}"
+    else:
+        ref = db.reference(f"Profile/Exclusive Character/{uid}/{aiName}")
+        snap = ref.get()
+        if not snap:
+            return ""
+        return f"Background: {snap.get('baseProfile', '')}"
 
 # =======================================================
 # Routes
@@ -257,18 +286,21 @@ def chat_reply(p: ChatPayload):
     if not _openai_client:
         return {"reply": "(stub) AI disabled"}
 
-    # --- anime profile handling ---
+    # profile handling
     profile_text = ""
-    if p.isAnimeCharacter and p.aiName:
-        _write_profile_if_anime(
+    if p.aiName:
+        _write_profile(
             aiName=p.aiName,
             aiBackground=p.aiBackground or "",
             uid=p.uid or "unknown",
-            contribution=p.aiBackground or ""
+            isAnime=p.isAnimeCharacter or False
         )
-        profile_text = _load_profile_for_prompt(p.aiName)
+        profile_text = _load_profile(
+            aiName=p.aiName,
+            uid=p.uid or "unknown",
+            isAnime=p.isAnimeCharacter or False
+        )
 
-    # --- build system prompt ---
     sys_prompt = "You are a supportive, empathetic companion."
     if p.aiName:
         sys_prompt += f" You are roleplaying as {p.aiName}."
@@ -296,6 +328,8 @@ def chat_reply(p: ChatPayload):
             _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, p.emotion)
 
         return {"reply": reply}
+    except Exception as e:
+        return {"reply": "(stub) error", "error": str(e)}
     except Exception as e:
         return {"reply": "(stub) error", "error": str(e)}
 

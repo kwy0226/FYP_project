@@ -20,6 +20,13 @@ from langdetect import detect
 # ---------- OpenAI chat ----------
 from openai import OpenAI
 
+# ---------- Firebase ----------
+import firebase_admin
+from firebase_admin import credentials, db
+
+# =======================================================
+# Init
+# =======================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
@@ -31,15 +38,23 @@ if OPENAI_API_KEY:
     except Exception as e:
         print("[OpenAI init error]", e)
 
+# Firebase init
+if not firebase_admin._apps:
+    fb_key_path = os.getenv("FIREBASE_KEY_PATH", "firebase_key.json")
+    if os.path.exists(fb_key_path):
+        cred = credentials.Certificate(fb_key_path)
+        firebase_admin.initialize_app(cred, {
+            "databaseURL": os.getenv("FIREBASE_URL", "")
+        })
+
 # =======================================================
 # FastAPI app
 # =======================================================
 app = FastAPI(title="Emotion API")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发模式允许全部
+    allow_origins=["*"],  # dev only
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,14 +65,26 @@ app.add_middleware(
 # =======================================================
 class TextPayload(BaseModel):
     text: str = Field(..., min_length=1)
+    uid: Optional[str] = None
+    chatId: Optional[str] = None
+    msgId: Optional[str] = None
 
 class AudioPayload(BaseModel):
-    wav_base64: str = Field(..., description="Base64-encoded WAV audio")
+    wav_base64: str
+    uid: Optional[str] = None
+    chatId: Optional[str] = None
+    msgId: Optional[str] = None
 
 class ChatPayload(BaseModel):
     message: str
     emotion: Optional[Dict] = None
     history: Optional[List[Dict]] = None
+    aiName: Optional[str] = None
+    aiGender: Optional[str] = None
+    aiBackground: Optional[str] = None
+    uid: Optional[str] = None
+    chatId: Optional[str] = None
+    msgId: Optional[str] = None
 
 # =======================================================
 # Models
@@ -122,23 +149,18 @@ def _base64_wav_to_tmpfile(b64: str) -> str:
         f.write(raw)
     return path
 
+def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict):
+    if not uid or not chatId or not msgId:
+        return
+    ref = db.reference(f"users/{uid}/chats/{chatId}/messages/{msgId}")
+    ref.update({"detectedEmotion": emotion})
+
 # =======================================================
 # Routes
 # =======================================================
 @app.get("/")
 def root():
     return {"status": "ok", "msg": "Emotion API root is alive"}
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "text_model_multi": TXT_MODEL_EN,
-        "text_model_zh": TXT_MODEL_ZH,
-        "speech_model": SPEECH_MODEL_NAME,
-        "openai_enabled": bool(_openai_client),
-        "openai_model": OPENAI_MODEL if _openai_client else None,
-    }
 
 @app.post("/nlp/text-emotion")
 def text_emotion(p: TextPayload):
@@ -157,12 +179,14 @@ def text_emotion(p: TextPayload):
                    "neu": "neutral", "neutral": "neutral",
                    "pos": "positive", "positive": "positive"}
         std_label = mapping.get(raw_label, raw_label)
-        return {
+        result = {
             "label": std_label,
             "confidence": float(probs[idx]),
             "probs": {mapping.get(labels[i].lower(), labels[i].lower()): float(probs[i]) for i in range(len(labels))},
             "used_model": mdl.name_or_path,
         }
+        _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"text inference error: {e}")
 
@@ -184,35 +208,35 @@ def audio_emotion(p: AudioPayload):
         scores = out["scores"].squeeze().detach().cpu().tolist()
         classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(torch.arange(len(scores)))
         mx_idx = int(torch.tensor(scores).argmax().item())
-        return {
+        result = {
             "label": str(label),
             "confidence": float(scores[mx_idx]),
             "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
             "model": SPEECH_MODEL_NAME,
         }
+        _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio inference error: {e}")
 
-# ----------------- Chat -----------------
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:
-        return {
-            "reply": "(stub) I hear you. Tell me more.",
-            "note": "Set OPENAI_API_KEY in Hugging Face Secrets to enable real replies."
-        }
-    sys_prompt = (
-        "You are a supportive, empathetic companion. "
-        "Be concise, warm, and practical. If an emotion hint is provided, "
-        "acknowledge it and respond accordingly."
-    )
+        return {"reply": "(stub) AI disabled"}
+    
+    sys_prompt = "You are a supportive, empathetic companion."
+    if p.aiName:
+        sys_prompt += f" You are roleplaying as {p.aiName}."
+
     user_text = p.message
     if p.emotion:
         user_text = f"[Emotion hint: {p.emotion}] {p.message}"
+
     msgs = [{"role": "system", "content": sys_prompt}]
     if p.history:
         msgs.extend(p.history)
     msgs.append({"role": "user", "content": user_text})
+
     try:
         resp = _openai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -220,17 +244,10 @@ def chat_reply(p: ChatPayload):
             temperature=0.6,
         )
         reply = resp.choices[0].message.content
+
+        if p.emotion:
+            _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, p.emotion)
+
         return {"reply": reply}
     except Exception as e:
-        return {
-            "reply": "(stub) Sorry, I'm having trouble replying right now.",
-            "error": str(e),
-        }
-
-# ----------------- Extra GET for debug -----------------
-@app.get("/chat/reply")
-def chat_reply_get():
-    return {
-        "status": "ok",
-        "note": "Use POST with JSON {message, emotion, history} to get a reply."
-    }
+        return {"reply": "(stub) error", "error": str(e)}

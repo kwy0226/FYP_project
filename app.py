@@ -164,19 +164,16 @@ def _base64_wav_to_tmpfile(b64: str) -> str:
 
 
 def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict):
+    # ⚠️ 写回 Chat/{uid}/{chatId}/messages/{msgId}
     if not uid or not chatId or not msgId:
         return
-    ref = db.reference(f"users/{uid}/chats/{chatId}/messages/{msgId}")
+    ref = db.reference(f"Chat/{uid}/{chatId}/messages/{msgId}")
     ref.update({"detectedEmotion": emotion})
 
 
 # ----------------- Profile (exclusive) -----------------
 def _character_key_for_user(uid: str, ai_name: str) -> str:
-    """
-    Use aiName as the character key under the user.
-    If you prefer numbered keys like Character1/2..., replace this function
-    to generate the next available index and return that key instead.
-    """
+    # 使用 aiName 作为该用户的角色 key；如需 Character1/2 形式，可在这里自定义生成规则
     safe_key = (ai_name or "").strip()
     if not safe_key:
         safe_key = "Character"
@@ -217,6 +214,7 @@ def _load_user_character_profile(uid: str, ai_name: Optional[str]) -> Dict:
 
 
 def _build_roleplay_system_prompt(profile: Dict) -> str:
+    # 系统提示：严格沉浸式角色扮演
     name = (profile.get("name") or "").strip()
     gender = (profile.get("gender") or "").strip()
     personality = (profile.get("personality") or "").strip()
@@ -224,8 +222,8 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
 
     lines = [
         "You are strictly roleplaying a character. Stay fully in-character.",
-        "Speak in first-person as the character. Be specific, warm and immersive.",
-        "Avoid AI disclaimers or meta commentary.",
+        "Speak in first-person as the character. Be concrete, warm and immersive.",
+        "Do not include AI disclaimers or out-of-character meta commentary.",
         "",
         f"Name: {name}" if name else "",
         f"Gender: {gender}" if gender else "",
@@ -233,7 +231,6 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
         f"Background: {background}" if background else "",
     ]
     return "\n".join([ln for ln in lines if ln])
-
 
 # =======================================================
 # Routes
@@ -351,10 +348,10 @@ def chat_reply(p: ChatPayload):
         )
         reply = resp.choices[0].message.content
 
+        # write back last detected emotion to the message (optional)
         if p.emotion:
             _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, p.emotion)
 
         return {"reply": reply}
     except Exception as e:
         return {"reply": "(stub) error", "error": str(e)}
-

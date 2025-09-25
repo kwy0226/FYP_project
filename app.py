@@ -186,8 +186,16 @@ def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict)
 
 # ----------------- Character Enrichment -----------------
 def _enrich_character_background(ai_name: str, ai_background: str) -> str:
-    wiki_zh = wikipediaapi.Wikipedia("zh")
-    wiki_en = wikipediaapi.Wikipedia("en")
+    user_agent = "EmotionMate/1.0 (wkyeoh0226@gmail.com)"  # ⚠️改成你项目的标识
+
+    wiki_zh = wikipediaapi.Wikipedia(
+        user_agent=user_agent,
+        language="zh"
+    )
+    wiki_en = wikipediaapi.Wikipedia(
+        user_agent=user_agent,
+        language="en"
+    )
 
     query_name = ai_name.strip()
     query_bg = ai_background.strip()
@@ -200,7 +208,6 @@ def _enrich_character_background(ai_name: str, ai_background: str) -> str:
         summary = page.summary[0:500]
         return ai_background + "\n\n[补全资料] " + summary
     return ai_background
-
 
 def _character_key_for_user(uid: str, ai_name: str) -> str:
     safe_key = (ai_name or "").strip()

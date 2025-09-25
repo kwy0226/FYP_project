@@ -11,3 +11,6 @@ langdetect
 openai>=1.0.0
 firebase-admin
 requests
+wikipedia-api
+soundfile
+librosa

@@ -1,6 +1,7 @@
 import os
 import base64
 import time
+import json
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, HTTPException
@@ -8,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # =======================================================
-# Hugging Face 缓存目录修复 (⚠️ 关键修复)
+# Hugging Face 缓存目录修复
 # =======================================================
 os.environ["TRANSFORMERS_CACHE"] = "/tmp/huggingface"
 os.environ["HF_HOME"] = "/tmp/huggingface"
@@ -47,15 +48,20 @@ if OPENAI_API_KEY:
     except Exception as e:
         print("[OpenAI init error]", e)
 
-# Firebase init
+# Firebase init (用环境变量 JSON)
 if not firebase_admin._apps:
-    fb_key_path = os.getenv("FIREBASE_KEY_PATH", "firebase_key.json")
-    if os.path.exists(fb_key_path):
-        cred = credentials.Certificate(fb_key_path)
-        firebase_admin.initialize_app(
-            cred,
-            {"databaseURL": os.getenv("FIREBASE_URL", "")},
-        )
+    cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+    if cred_json:
+        try:
+            cred_dict = json.loads(cred_json)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(
+                cred,
+                {"databaseURL": os.getenv("FIREBASE_URL", "")},
+            )
+            print("[Firebase] Initialized from FIREBASE_CREDENTIALS_JSON")
+        except Exception as e:
+            print("[Firebase init error]", e)
 
 # =======================================================
 # FastAPI app
@@ -258,7 +264,6 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
     ]
     return "\n".join([ln for ln in lines if ln])
 
-
 # =======================================================
 # Routes
 # =======================================================
@@ -418,4 +423,3 @@ def audio_process(p: AudioPayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
-        

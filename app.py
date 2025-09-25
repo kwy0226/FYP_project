@@ -7,6 +7,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# =======================================================
+# Hugging Face 缓存目录修复 (⚠️ 关键修复)
+# =======================================================
+# Cloud Run / Hugging Face Spaces 的 /.cache 没有写权限
+# 强制缓存到 /tmp/huggingface
+os.environ["TRANSFORMERS_CACHE"] = "/tmp/huggingface"
+os.environ["HF_HOME"] = "/tmp/huggingface"
+os.environ["HF_DATASETS_CACHE"] = "/tmp/huggingface/datasets"
+
 # ---------- ML deps ----------
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -15,6 +24,9 @@ import torchaudio
 
 # language detection
 from langdetect import detect
+
+# wikipedia
+import wikipediaapi
 
 # ---------- OpenAI ----------
 from openai import OpenAI
@@ -139,7 +151,7 @@ def _ensure_speech_model():
     if _SPEECH_EMO is None:
         _SPEECH_EMO = EncoderClassifier.from_hparams(
             source=SPEECH_MODEL_NAME,
-            savedir="pretrained_models/speech_emotion",
+            savedir="/tmp/pretrained_models/speech_emotion",  # ⚠️ 也放 /tmp
         )
 
 # =======================================================
@@ -164,16 +176,32 @@ def _base64_wav_to_tmpfile(b64: str) -> str:
 
 
 def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict):
-    # ⚠️ 写回 Chat/{uid}/{chatId}/messages/{msgId}
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
-    ref.update({"detectedEmotion": emotion})
+    ref.update({"emotion": emotion})
+
+
+# ----------------- Character Enrichment -----------------
+def _enrich_character_background(ai_name: str, ai_background: str) -> str:
+    wiki_zh = wikipediaapi.Wikipedia("zh")
+    wiki_en = wikipediaapi.Wikipedia("en")
+
+    query_name = ai_name.strip()
+    query_bg = ai_background.strip()
+
+    page = wiki_zh.page(query_name)
+    if not page.exists():
+        page = wiki_en.page(query_name)
+
+    if page.exists():
+        summary = page.summary[0:500]
+        return ai_background + "\n\n[补全资料] " + summary
+    return ai_background
 
 
 # ----------------- Profile (exclusive) -----------------
 def _character_key_for_user(uid: str, ai_name: str) -> str:
-    # 使用 aiName 作为该用户的角色 key；如需 Character1/2 形式，可在这里自定义生成规则
     safe_key = (ai_name or "").strip()
     if not safe_key:
         safe_key = "Character"
@@ -194,11 +222,15 @@ def _upsert_user_character_profile(
     ref = db.reference(f"Profile/Character/{uid}/{char_key}")
     snap = ref.get() or {}
 
+    enriched_bg = ai_background
+    if ai_background and snap.get("background") != ai_background:
+        enriched_bg = _enrich_character_background(ai_name, ai_background)
+
     updates = {
         "name": ai_name,
         "gender": ai_gender or snap.get("gender", ""),
         "personality": ai_personality or snap.get("personality", ""),
-        "background": ai_background or snap.get("background", ""),
+        "background": enriched_bg or snap.get("background", ""),
         "lastUpdated": now_ts,
     }
     ref.update(updates)
@@ -214,7 +246,6 @@ def _load_user_character_profile(uid: str, ai_name: Optional[str]) -> Dict:
 
 
 def _build_roleplay_system_prompt(profile: Dict) -> str:
-    # 系统提示：严格沉浸式角色扮演
     name = (profile.get("name") or "").strip()
     gender = (profile.get("gender") or "").strip()
     personality = (profile.get("personality") or "").strip()
@@ -222,8 +253,8 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
 
     lines = [
         "You are strictly roleplaying a character. Stay fully in-character.",
-        "Speak in first-person as the character. Be concrete, warm and immersive.",
-        "Do not include AI disclaimers or out-of-character meta commentary.",
+        "Speak in first-person as the character. Be immersive and natural.",
+        "Do not include AI disclaimers or meta commentary.",
         "",
         f"Name: {name}" if name else "",
         f"Gender: {gender}" if gender else "",
@@ -231,6 +262,7 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
         f"Background: {background}" if background else "",
     ]
     return "\n".join([ln for ln in lines if ln])
+
 
 # =======================================================
 # Routes
@@ -253,22 +285,13 @@ def text_emotion(p: TextPayload):
             probs = _softmax(outputs.logits)[0].cpu().tolist()
         idx = int(torch.tensor(probs).argmax().item())
         raw_label = labels[idx].lower()
-        mapping = {
-            "neg": "negative",
-            "negative": "negative",
-            "neu": "neutral",
-            "neutral": "neutral",
-            "pos": "positive",
-            "positive": "positive",
-        }
+        mapping = {"neg": "negative", "negative": "negative",
+                   "neu": "neutral", "neutral": "neutral",
+                   "pos": "positive", "positive": "positive"}
         std_label = mapping.get(raw_label, raw_label)
         result = {
             "label": std_label,
             "confidence": float(probs[idx]),
-            "probs": {
-                mapping.get(labels[i].lower(), labels[i].lower()): float(probs[i])
-                for i in range(len(labels))
-            },
             "used_model": mdl.name_or_path,
         }
         _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
@@ -282,29 +305,16 @@ def audio_emotion(p: AudioPayload):
     try:
         _ensure_speech_model()
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
-        try:
-            wav, sr = torchaudio.load(wav_path)
-            if sr != 16000:
-                wav = torchaudio.functional.resample(wav, sr, 16000)
-                torchaudio.save(wav_path, wav, 16000)
-        except Exception:
-            pass
+        wav, sr = torchaudio.load(wav_path)
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+            torchaudio.save(wav_path, wav, 16000)
 
         out = _SPEECH_EMO.classify_file(wav_path)
         os.remove(wav_path)
 
         label = out["predicted_label"]
-        scores = out["scores"].squeeze().detach().cpu().tolist()
-        classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(
-            torch.arange(len(scores))
-        )
-        mx_idx = int(torch.tensor(scores).argmax().item())
-        result = {
-            "label": str(label),
-            "confidence": float(scores[mx_idx]),
-            "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
-            "model": SPEECH_MODEL_NAME,
-        }
+        result = {"label": str(label), "model": SPEECH_MODEL_NAME}
         _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
         return result
     except Exception as e:
@@ -314,9 +324,8 @@ def audio_emotion(p: AudioPayload):
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:
-        return {"reply": "(stub) AI disabled"}
+        return {"reply": "(AI disabled)"}
 
-    # persist/update user's exclusive character profile
     if p.uid and p.aiName:
         _upsert_user_character_profile(
             uid=p.uid,
@@ -326,11 +335,9 @@ def chat_reply(p: ChatPayload):
             ai_background=p.aiBackground,
         )
 
-    # load profile for prompt
     profile = _load_user_character_profile(p.uid or "", p.aiName or "")
     sys_prompt = _build_roleplay_system_prompt(profile)
 
-    # user message (attach emotion hint if present)
     user_text = p.message
     if p.emotion:
         user_text = f"[Emotion hint: {p.emotion}] {p.message}"
@@ -342,16 +349,17 @@ def chat_reply(p: ChatPayload):
 
     try:
         resp = _openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=msgs,
-            temperature=0.7,
+            model=OPENAI_MODEL, messages=msgs, temperature=0.7,
         )
         reply = resp.choices[0].message.content
 
-        # write back last detected emotion to the message (optional)
-        if p.emotion:
-            _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, p.emotion)
+        emo_check = text_emotion(TextPayload(text=reply))
+        if emo_check.get("label") == "negative":
+            resp = _openai_client.chat.completions.create(
+                model=OPENAI_MODEL, messages=msgs, temperature=0.7,
+            )
+            reply = resp.choices[0].message.content
 
         return {"reply": reply}
     except Exception as e:
-        return {"reply": "(stub) error", "error": str(e)}
+        return {"reply": "(error)", "error": str(e)}

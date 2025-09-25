@@ -10,8 +10,6 @@ from pydantic import BaseModel, Field
 # =======================================================
 # Hugging Face 缓存目录修复 (⚠️ 关键修复)
 # =======================================================
-# Cloud Run / Hugging Face Spaces 的 /.cache 没有写权限
-# 强制缓存到 /tmp/huggingface
 os.environ["TRANSFORMERS_CACHE"] = "/tmp/huggingface"
 os.environ["HF_HOME"] = "/tmp/huggingface"
 os.environ["HF_DATASETS_CACHE"] = "/tmp/huggingface/datasets"
@@ -94,13 +92,11 @@ class ChatPayload(BaseModel):
     emotion: Optional[Dict] = None
     history: Optional[List[Dict]] = None
 
-    # character profile fields (exclusive per user)
     aiName: Optional[str] = None
     aiGender: Optional[str] = None
     aiBackground: Optional[str] = None
-    aiPersonality: Optional[str] = None  # new
+    aiPersonality: Optional[str] = None
 
-    # routing
     uid: Optional[str] = None
     chatId: Optional[str] = None
     msgId: Optional[str] = None
@@ -151,7 +147,7 @@ def _ensure_speech_model():
     if _SPEECH_EMO is None:
         _SPEECH_EMO = EncoderClassifier.from_hparams(
             source=SPEECH_MODEL_NAME,
-            savedir="/tmp/pretrained_models/speech_emotion",  # ⚠️ 也放 /tmp
+            savedir="/tmp/pretrained_models/speech_emotion",
         )
 
 # =======================================================
@@ -200,7 +196,6 @@ def _enrich_character_background(ai_name: str, ai_background: str) -> str:
     return ai_background
 
 
-# ----------------- Profile (exclusive) -----------------
 def _character_key_for_user(uid: str, ai_name: str) -> str:
     safe_key = (ai_name or "").strip()
     if not safe_key:
@@ -363,3 +358,64 @@ def chat_reply(p: ChatPayload):
         return {"reply": reply}
     except Exception as e:
         return {"reply": "(error)", "error": str(e)}
+
+
+# =======================================================
+# New Route: /audio/process
+# =======================================================
+@app.post("/audio/process")
+def audio_process(p: AudioPayload):
+    if not _openai_client:
+        raise HTTPException(status_code=500, detail="OpenAI client not initialized")
+
+    try:
+        # Step 1: 保存临时 wav 文件
+        wav_path = _base64_wav_to_tmpfile(p.wav_base64)
+
+        # Step 2: OpenAI Whisper 转写
+        with open(wav_path, "rb") as f:
+            transcript = _openai_client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f
+            )
+        user_text = transcript.text.strip()
+
+        # Step 3: Hugging Face SER
+        _ensure_speech_model()
+        out = _SPEECH_EMO.classify_file(wav_path)
+        os.remove(wav_path)
+
+        label = out["predicted_label"]
+        scores = out["scores"].squeeze().detach().cpu().tolist()
+        classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(
+            torch.arange(len(scores))
+        )
+        emotion = {
+            "label": str(label),
+            "confidence": float(max(scores)),
+            "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
+        }
+
+        # Step 4: 写入 Firebase
+        if p.uid and p.chatId and p.msgId:
+            ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
+            ref.update({"text": user_text, "emotion": emotion})
+
+        # Step 5: 调用 ChatGPT
+        msgs = [{"role": "user", "content": f"[Emotion hint: {emotion}] {user_text}"}]
+        resp = _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=msgs,
+            temperature=0.7,
+        )
+        reply = resp.choices[0].message.content
+
+        return {
+            "text": user_text,
+            "emotion": emotion,
+            "reply": reply,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
+        

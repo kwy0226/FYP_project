@@ -167,7 +167,7 @@ def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict)
     # ⚠️ 写回 Chat/{uid}/{chatId}/messages/{msgId}
     if not uid or not chatId or not msgId:
         return
-    ref = db.reference(f"Chat/{uid}/{chatId}/messages/{msgId}")
+    ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
     ref.update({"detectedEmotion": emotion})
 
 

@@ -184,18 +184,23 @@ def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict)
     ref.update({"emotion": emotion})
 
 
+def _write_reply_to_firebase(uid: str, chatId: str, msgId: str, reply: str):
+    """把 AI 回复写进 Firebase 的同一个 msgId"""
+    if not uid or not chatId or not msgId:
+        return
+    ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
+    ref.update({
+        "reply": reply,
+        "replyCreatedAt": int(time.time() * 1000),
+    })
+
+
 # ----------------- Character Enrichment -----------------
 def _enrich_character_background(ai_name: str, ai_background: str) -> str:
     user_agent = "EmotionMate/1.0 (wkyeoh0226@gmail.com)"  # ⚠️改成你项目的标识
 
-    wiki_zh = wikipediaapi.Wikipedia(
-        user_agent=user_agent,
-        language="zh"
-    )
-    wiki_en = wikipediaapi.Wikipedia(
-        user_agent=user_agent,
-        language="en"
-    )
+    wiki_zh = wikipediaapi.Wikipedia(user_agent=user_agent, language="zh")
+    wiki_en = wikipediaapi.Wikipedia(user_agent=user_agent, language="en")
 
     query_name = ai_name.strip()
     query_bg = ai_background.strip()
@@ -208,6 +213,7 @@ def _enrich_character_background(ai_name: str, ai_background: str) -> str:
         summary = page.summary[0:500]
         return ai_background + "\n\n[补全资料] " + summary
     return ai_background
+
 
 def _character_key_for_user(uid: str, ai_name: str) -> str:
     safe_key = (ai_name or "").strip()
@@ -360,31 +366,30 @@ def chat_reply(p: ChatPayload):
         )
         reply = resp.choices[0].message.content
 
+        # 保存 AI 回复
+        _write_reply_to_firebase(p.uid, p.chatId, reply)
+
         emo_check = text_emotion(TextPayload(text=reply))
         if emo_check.get("label") == "negative":
             resp = _openai_client.chat.completions.create(
                 model=OPENAI_MODEL, messages=msgs, temperature=0.7,
             )
             reply = resp.choices[0].message.content
+            _write_reply_to_firebase(p.uid, p.chatId, reply)
 
         return {"reply": reply}
     except Exception as e:
         return {"reply": "(error)", "error": str(e)}
 
 
-# =======================================================
-# New Route: /audio/process
-# =======================================================
 @app.post("/audio/process")
 def audio_process(p: AudioPayload):
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
 
     try:
-        # Step 1: 保存临时 wav 文件
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
 
-        # Step 2: OpenAI Whisper 转写
         with open(wav_path, "rb") as f:
             transcript = _openai_client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
@@ -392,7 +397,6 @@ def audio_process(p: AudioPayload):
             )
         user_text = transcript.text.strip()
 
-        # Step 3: Hugging Face SER
         _ensure_speech_model()
         out = _SPEECH_EMO.classify_file(wav_path)
         os.remove(wav_path)
@@ -408,12 +412,10 @@ def audio_process(p: AudioPayload):
             "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
         }
 
-        # Step 4: 写入 Firebase
         if p.uid and p.chatId and p.msgId:
             ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
             ref.update({"text": user_text, "emotion": emotion})
 
-        # Step 5: 调用 ChatGPT
         msgs = [{"role": "user", "content": f"[Emotion hint: {emotion}] {user_text}"}]
         resp = _openai_client.chat.completions.create(
             model=OPENAI_MODEL,
@@ -421,6 +423,9 @@ def audio_process(p: AudioPayload):
             temperature=0.7,
         )
         reply = resp.choices[0].message.content
+
+        # 保存 AI 回复
+        _write_reply_to_firebase(p.uid, p.chatId, reply)
 
         return {
             "text": user_text,
@@ -430,3 +435,4 @@ def audio_process(p: AudioPayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
+

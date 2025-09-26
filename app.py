@@ -190,8 +190,12 @@ def _write_reply_to_firebase(uid: str, chatId: str, msgId: str, reply: str):
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
     ref.update({
-        "reply": reply,
-        "replyCreatedAt": int(time.time() * 1000),
+        "aiReply": {
+            "content": reply,
+            "role": "assistant",
+            "type": "text",
+            "createdAt": int(time.time() * 1000)
+        }
     })
 
 
@@ -224,29 +228,36 @@ def _character_key_for_user(uid: str, ai_name: str) -> str:
 
 def _upsert_user_character_profile(
     uid: str,
+    char_id: str,
     ai_name: Optional[str],
     ai_gender: Optional[str],
     ai_personality: Optional[str],
     ai_background: Optional[str],
 ):
-    if not uid or not ai_name:
+    """直接写入 character/{uid}/{charId} 下的 aiBackground"""
+    if not uid or not char_id:
         return
+
     now_ts = int(time.time() * 1000)
-    char_key = _character_key_for_user(uid, ai_name)
-    ref = db.reference(f"Profile/Character/{uid}/{char_key}")
+    ref = db.reference(f"character/{uid}/{char_id}")
     snap = ref.get() or {}
 
+    # 如果传了背景，就尝试调用 Wikipedia 做补全
     enriched_bg = ai_background
-    if ai_background and snap.get("background") != ai_background:
+    if ai_background:
         enriched_bg = _enrich_character_background(ai_name, ai_background)
 
     updates = {
-        "name": ai_name,
-        "gender": ai_gender or snap.get("gender", ""),
-        "personality": ai_personality or snap.get("personality", ""),
-        "background": enriched_bg or snap.get("background", ""),
-        "lastUpdated": now_ts,
+        "aiName": ai_name or snap.get("aiName", ""),
+        "aiGender": ai_gender or snap.get("aiGender", ""),
+        "aiPersonality": ai_personality or snap.get("aiPersonality", ""),
+        "aiBackground": enriched_bg or snap.get("aiBackground", ""),
+        "updatedAt": now_ts,
     }
+
+    if not snap:  # 新建时加 createdAt
+        updates["createdAt"] = now_ts
+
     ref.update(updates)
 
 
@@ -339,9 +350,17 @@ def chat_reply(p: ChatPayload):
     if not _openai_client:
         return {"reply": "(AI disabled)"}
 
+    # 1. 保存 user 的 emotion
+    if p.uid and p.chatId and p.msgId:
+        emo_result = text_emotion(TextPayload(text=p.message, uid=p.uid, chatId=p.chatId, msgId=p.msgId))
+        ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
+        ref.update({"emotion": emo_result})
+
+    # 2. 补充角色背景
     if p.uid and p.aiName:
         _upsert_user_character_profile(
             uid=p.uid,
+            char_id=p.msgId,   # ⚠️ 这里你可以换成真正的 characterId
             ai_name=p.aiName,
             ai_gender=p.aiGender,
             ai_personality=p.aiPersonality,
@@ -351,14 +370,10 @@ def chat_reply(p: ChatPayload):
     profile = _load_user_character_profile(p.uid or "", p.aiName or "")
     sys_prompt = _build_roleplay_system_prompt(profile)
 
-    user_text = p.message
-    if p.emotion:
-        user_text = f"[Emotion hint: {p.emotion}] {p.message}"
-
     msgs = [{"role": "system", "content": sys_prompt}]
     if p.history:
         msgs.extend(p.history)
-    msgs.append({"role": "user", "content": user_text})
+    msgs.append({"role": "user", "content": p.message})
 
     try:
         resp = _openai_client.chat.completions.create(
@@ -366,19 +381,13 @@ def chat_reply(p: ChatPayload):
         )
         reply = resp.choices[0].message.content
 
-        # 保存 AI 回复
-        _write_reply_to_firebase(p.uid, p.chatId, reply)
-
-        emo_check = text_emotion(TextPayload(text=reply))
-        if emo_check.get("label") == "negative":
-            resp = _openai_client.chat.completions.create(
-                model=OPENAI_MODEL, messages=msgs, temperature=0.7,
-            )
-            reply = resp.choices[0].message.content
-            _write_reply_to_firebase(p.uid, p.chatId, reply)
+        # 3. 保存 AI 回复
+        _write_reply_to_firebase(p.uid, p.chatId, p.msgId, reply)
 
         return {"reply": reply}
     except Exception as e:
+        # 出错时也写入 Firebase，方便前端显示
+        _write_reply_to_firebase(p.uid, p.chatId, p.msgId, "(error)")
         return {"reply": "(error)", "error": str(e)}
 
 
@@ -435,4 +444,3 @@ def audio_process(p: AudioPayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
-

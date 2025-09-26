@@ -424,23 +424,39 @@ def audio_process(p: AudioPayload):
         user_text = transcript.text.strip()
         print("[audio_process] transcription result:", user_text)
 
-        # SpeechBrain 情绪识别
-        _ensure_speech_model()
-        print("[audio_process] running SpeechBrain classifier...")
-        out = _SPEECH_EMO.classify_file(wav_path)
-        print("[audio_process] speechbrain result:", out)
-        os.remove(wav_path)
+# SpeechBrain 情绪识别（新版 classify_batch）
+_ensure_speech_model()
+print("[audio_process] running SpeechBrain classifier...")
 
-        label = out["predicted_label"]
-        scores = out["scores"].squeeze().detach().cpu().tolist()
-        classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(
-            torch.arange(len(scores))
-        )
-        emotion = {
-            "label": str(label),
-            "confidence": float(max(scores)),
-            "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
-        }
+import torchaudio
+wav, sr = torchaudio.load(wav_path)
+if sr != 16000:
+    wav = torchaudio.functional.resample(wav, sr, 16000)
+    sr = 16000
+
+out_probs, out_classes = _SPEECH_EMO.classify_batch(wav)
+print("[audio_process] speechbrain raw output:", out_probs, out_classes)
+
+# 解析结果
+predicted_index = out_classes[0].item()
+label = _SPEECH_EMO.hparams.label_encoder.decode_torch(
+    torch.tensor([predicted_index])
+)[0]
+
+scores = out_probs.squeeze().detach().cpu().tolist()
+classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(
+    torch.arange(len(scores))
+)
+
+emotion = {
+    "label": str(label),
+    "confidence": float(max(scores)),
+    "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
+}
+print("[audio_process] final emotion dict:", emotion)
+
+# 删除临时文件
+os.remove(wav_path)
         print("[audio_process] final emotion dict:", emotion)
 
         # 写入 Firebase

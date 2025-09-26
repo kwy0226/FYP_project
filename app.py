@@ -407,13 +407,6 @@ def audio_process(p: AudioPayload):
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
         print("[audio_process] temp wav saved:", wav_path)
 
-        # 检查文件大小
-        if os.path.exists(wav_path):
-            size = os.path.getsize(wav_path)
-            print(f"[audio_process] file exists, size={size} bytes")
-        else:
-            print("[audio_process][ERROR] wav file not found after save")
-
         # 调用 OpenAI 语音转写
         with open(wav_path, "rb") as f:
             print("[audio_process] sending file to OpenAI transcription...")
@@ -424,40 +417,37 @@ def audio_process(p: AudioPayload):
         user_text = transcript.text.strip()
         print("[audio_process] transcription result:", user_text)
 
-# SpeechBrain 情绪识别（新版 classify_batch）
-_ensure_speech_model()
-print("[audio_process] running SpeechBrain classifier...")
+        # ================= SpeechBrain 情绪识别（新版 classify_batch） =================
+        _ensure_speech_model()
+        print("[audio_process] running SpeechBrain classifier...")
 
-import torchaudio
-wav, sr = torchaudio.load(wav_path)
-if sr != 16000:
-    wav = torchaudio.functional.resample(wav, sr, 16000)
-    sr = 16000
+        wav, sr = torchaudio.load(wav_path)
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+            sr = 16000
 
-out_probs, out_classes = _SPEECH_EMO.classify_batch(wav)
-print("[audio_process] speechbrain raw output:", out_probs, out_classes)
+        out_probs, out_classes = _SPEECH_EMO.classify_batch(wav)
+        print("[audio_process] speechbrain raw output:", out_probs, out_classes)
 
-# 解析结果
-predicted_index = out_classes[0].item()
-label = _SPEECH_EMO.hparams.label_encoder.decode_torch(
-    torch.tensor([predicted_index])
-)[0]
+        predicted_index = out_classes[0].item()
+        label = _SPEECH_EMO.hparams.label_encoder.decode_torch(
+            torch.tensor([predicted_index])
+        )[0]
 
-scores = out_probs.squeeze().detach().cpu().tolist()
-classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(
-    torch.arange(len(scores))
-)
+        scores = out_probs.squeeze().detach().cpu().tolist()
+        classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(
+            torch.arange(len(scores))
+        )
 
-emotion = {
-    "label": str(label),
-    "confidence": float(max(scores)),
-    "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
-}
-print("[audio_process] final emotion dict:", emotion)
-
-# 删除临时文件
-os.remove(wav_path)
+        emotion = {
+            "label": str(label),
+            "confidence": float(max(scores)),
+            "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
+        }
         print("[audio_process] final emotion dict:", emotion)
+
+        # 删除临时文件
+        os.remove(wav_path)
 
         # 写入 Firebase
         if p.uid and p.chatId and p.msgId:

@@ -400,17 +400,35 @@ def audio_process(p: AudioPayload):
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
 
     try:
-        wav_path = _base64_wav_to_tmpfile(p.wav_base64)
+        print("[audio_process] === START ===")
+        print("[audio_process] payload length:", len(p.wav_base64) if p.wav_base64 else 0)
 
+        # 保存临时 wav 文件
+        wav_path = _base64_wav_to_tmpfile(p.wav_base64)
+        print("[audio_process] temp wav saved:", wav_path)
+
+        # 检查文件大小
+        if os.path.exists(wav_path):
+            size = os.path.getsize(wav_path)
+            print(f"[audio_process] file exists, size={size} bytes")
+        else:
+            print("[audio_process][ERROR] wav file not found after save")
+
+        # 调用 OpenAI 语音转写
         with open(wav_path, "rb") as f:
+            print("[audio_process] sending file to OpenAI transcription...")
             transcript = _openai_client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
                 file=f
             )
         user_text = transcript.text.strip()
+        print("[audio_process] transcription result:", user_text)
 
+        # SpeechBrain 情绪识别
         _ensure_speech_model()
+        print("[audio_process] running SpeechBrain classifier...")
         out = _SPEECH_EMO.classify_file(wav_path)
+        print("[audio_process] speechbrain result:", out)
         os.remove(wav_path)
 
         label = out["predicted_label"]
@@ -423,20 +441,30 @@ def audio_process(p: AudioPayload):
             "confidence": float(max(scores)),
             "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
         }
+        print("[audio_process] final emotion dict:", emotion)
 
+        # 写入 Firebase
         if p.uid and p.chatId and p.msgId:
             ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
             ref.update({"text": user_text, "emotion": emotion})
+            print("[audio_process] firebase updated")
 
+        # 构建对话消息并调用 OpenAI
         msgs = [{"role": "user", "content": f"[Emotion hint: {emotion}] {user_text}"}]
+        print("[audio_process] sending chat completion with msgs:", msgs)
+
         resp = _openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs,
             temperature=0.7,
         )
         reply = resp.choices[0].message.content
-        _write_reply_to_firebase(p.uid, p.chatId, p.msgId, reply)
+        print("[audio_process] reply from OpenAI:", reply)
 
+        _write_reply_to_firebase(p.uid, p.chatId, p.msgId, reply)
+        print("[audio_process] reply written to firebase")
+
+        print("[audio_process] === DONE ===")
         return {
             "text": user_text,
             "emotion": emotion,
@@ -444,4 +472,8 @@ def audio_process(p: AudioPayload):
         }
 
     except Exception as e:
+        import traceback
+        print("[audio_process][EXCEPTION]", str(e))
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
+

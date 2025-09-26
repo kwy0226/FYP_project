@@ -277,6 +277,26 @@ def _upsert_user_character_profile(
     ref.update(updates)
 
 
+def _build_roleplay_system_prompt(profile: Dict) -> str:
+    """基于数据库中的角色资料构造 Roleplay Prompt"""
+    name = (profile.get("aiName") or "").strip()
+    gender = (profile.get("aiGender") or "").strip()
+    personality = (profile.get("aiPersonality") or "").strip()
+    background = (profile.get("aiBackground") or "").strip()
+
+    lines = [
+        "你正在严格扮演这个角色，不要跳出角色。",
+        "必须用第一人称说话，让对话自然沉浸。",
+        "不要包含 AI 身份、免责声明或任何元信息。",
+        "",
+        f"名字: {name}" if name else "",
+        f"性别: {gender}" if gender else "",
+        f"性格: {personality}" if personality else "",
+        f"背景: {background}" if background else "",
+    ]
+    return "\n".join([ln for ln in lines if ln])
+
+
 # =======================================================
 # Chat + Emotion Routes
 # =======================================================
@@ -425,4 +445,3 @@ def audio_process(p: AudioPayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
-

@@ -185,7 +185,6 @@ def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict)
 
 
 def _write_reply_to_firebase(uid: str, chatId: str, msgId: str, reply: str):
-    """把 AI 回复写进 Firebase 的同一个 msgId"""
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
@@ -199,31 +198,51 @@ def _write_reply_to_firebase(uid: str, chatId: str, msgId: str, reply: str):
     })
 
 
-# ----------------- Character Enrichment -----------------
-def _enrich_character_background(ai_name: str, ai_background: str) -> str:
-    user_agent = "EmotionMate/1.0 (wkyeoh0226@gmail.com)"  # ⚠️改成你项目的标识
-
+# =======================================================
+# Character Profile Refinement
+# =======================================================
+def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
+    """补全资料 + 自动生成 Personality"""
+    user_agent = "EmotionMate/1.0 (wkyeoh0226@gmail.com)"
     wiki_zh = wikipediaapi.Wikipedia(user_agent=user_agent, language="zh")
     wiki_en = wikipediaapi.Wikipedia(user_agent=user_agent, language="en")
 
-    query_name = ai_name.strip()
-    query_bg = ai_background.strip()
-
-    page = wiki_zh.page(query_name)
+    page = wiki_zh.page(ai_name.strip())
+    summary = ""
     if not page.exists():
-        page = wiki_en.page(query_name)
+        page = wiki_en.page(ai_name.strip())
+        if page.exists():
+            summary = page.summary[0:800]
+            # 翻译成中文
+            resp = _openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "你是一个翻译助手，把输入的英文简介翻译成中文，保持简洁自然。"},
+                    {"role": "user", "content": summary}
+                ]
+            )
+            summary = resp.choices[0].message.content.strip()
+    else:
+        summary = page.summary[0:800]
 
-    if page.exists():
-        summary = page.summary[0:500]
-        return ai_background + "\n\n[补全资料] " + summary
-    return ai_background
+    full_bg = ai_background
+    if summary:
+        full_bg += "\n\n[补全资料] " + summary
 
+    # 提炼性格 + 背景
+    resp2 = _openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "你是一个角色分析专家。"},
+            {"role": "user", "content": f"以下是角色 {ai_name} 的背景资料：\n{full_bg}\n\n请帮我总结：\n1. 角色的性格特点（简洁中文描述）。\n2. 精炼一个适合 Roleplay 的背景描述。"}
+        ]
+    )
+    result_text = resp2.choices[0].message.content.strip()
 
-def _character_key_for_user(uid: str, ai_name: str) -> str:
-    safe_key = (ai_name or "").strip()
-    if not safe_key:
-        safe_key = "Character"
-    return safe_key
+    return {
+        "aiBackground": full_bg,
+        "aiPersonality": result_text
+    }
 
 
 def _upsert_user_character_profile(
@@ -231,65 +250,35 @@ def _upsert_user_character_profile(
     char_id: str,
     ai_name: Optional[str],
     ai_gender: Optional[str],
-    ai_personality: Optional[str],
     ai_background: Optional[str],
 ):
-    """直接写入 character/{uid}/{charId} 下的 aiBackground"""
-    if not uid or not char_id:
+    if not uid or not char_id or not ai_name:
         return
 
     now_ts = int(time.time() * 1000)
     ref = db.reference(f"character/{uid}/{char_id}")
     snap = ref.get() or {}
 
-    # 如果传了背景，就尝试调用 Wikipedia 做补全
-    enriched_bg = ai_background
+    enriched = {}
     if ai_background:
-        enriched_bg = _enrich_character_background(ai_name, ai_background)
+        enriched = _refine_character_profile(ai_name, ai_background)
 
     updates = {
         "aiName": ai_name or snap.get("aiName", ""),
         "aiGender": ai_gender or snap.get("aiGender", ""),
-        "aiPersonality": ai_personality or snap.get("aiPersonality", ""),
-        "aiBackground": enriched_bg or snap.get("aiBackground", ""),
+        "aiBackground": enriched.get("aiBackground", ai_background or snap.get("aiBackground", "")),
+        "aiPersonality": enriched.get("aiPersonality", snap.get("aiPersonality", "")),
         "updatedAt": now_ts,
     }
 
-    if not snap:  # 新建时加 createdAt
+    if not snap:
         updates["createdAt"] = now_ts
 
     ref.update(updates)
 
 
-def _load_user_character_profile(uid: str, ai_name: Optional[str]) -> Dict:
-    if not uid or not ai_name:
-        return {}
-    char_key = _character_key_for_user(uid, ai_name)
-    ref = db.reference(f"Profile/Character/{uid}/{char_key}")
-    snap = ref.get()
-    return snap or {}
-
-
-def _build_roleplay_system_prompt(profile: Dict) -> str:
-    name = (profile.get("name") or "").strip()
-    gender = (profile.get("gender") or "").strip()
-    personality = (profile.get("personality") or "").strip()
-    background = (profile.get("background") or "").strip()
-
-    lines = [
-        "You are strictly roleplaying a character. Stay fully in-character.",
-        "Speak in first-person as the character. Be immersive and natural.",
-        "Do not include AI disclaimers or meta commentary.",
-        "",
-        f"Name: {name}" if name else "",
-        f"Gender: {gender}" if gender else "",
-        f"Personality: {personality}" if personality else "",
-        f"Background: {background}" if background else "",
-    ]
-    return "\n".join([ln for ln in lines if ln])
-
 # =======================================================
-# Routes
+# Chat + Emotion Routes
 # =======================================================
 @app.get("/")
 def root():
@@ -350,24 +339,22 @@ def chat_reply(p: ChatPayload):
     if not _openai_client:
         return {"reply": "(AI disabled)"}
 
-    # 1. 保存 user 的 emotion
     if p.uid and p.chatId and p.msgId:
         emo_result = text_emotion(TextPayload(text=p.message, uid=p.uid, chatId=p.chatId, msgId=p.msgId))
         ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
         ref.update({"emotion": emo_result})
 
-    # 2. 补充角色背景
     if p.uid and p.aiName:
         _upsert_user_character_profile(
             uid=p.uid,
-            char_id=p.msgId,   # ⚠️ 这里你可以换成真正的 characterId
+            char_id=p.chatId,
             ai_name=p.aiName,
             ai_gender=p.aiGender,
-            ai_personality=p.aiPersonality,
             ai_background=p.aiBackground,
         )
 
-    profile = _load_user_character_profile(p.uid or "", p.aiName or "")
+    ref = db.reference(f"character/{p.uid}/{p.chatId}")
+    profile = ref.get() or {}
     sys_prompt = _build_roleplay_system_prompt(profile)
 
     msgs = [{"role": "system", "content": sys_prompt}]
@@ -380,13 +367,9 @@ def chat_reply(p: ChatPayload):
             model=OPENAI_MODEL, messages=msgs, temperature=0.7,
         )
         reply = resp.choices[0].message.content
-
-        # 3. 保存 AI 回复
         _write_reply_to_firebase(p.uid, p.chatId, p.msgId, reply)
-
         return {"reply": reply}
     except Exception as e:
-        # 出错时也写入 Firebase，方便前端显示
         _write_reply_to_firebase(p.uid, p.chatId, p.msgId, "(error)")
         return {"reply": "(error)", "error": str(e)}
 
@@ -432,9 +415,7 @@ def audio_process(p: AudioPayload):
             temperature=0.7,
         )
         reply = resp.choices[0].message.content
-
-        # 保存 AI 回复
-        _write_reply_to_firebase(p.uid, p.chatId, reply)
+        _write_reply_to_firebase(p.uid, p.chatId, p.msgId, reply)
 
         return {
             "text": user_text,
@@ -444,3 +425,4 @@ def audio_process(p: AudioPayload):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
+

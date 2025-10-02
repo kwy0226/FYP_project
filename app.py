@@ -416,4 +416,6 @@ def audio_process(p: AudioPayload):
                 {"role": "user", "content": f"[Emotion: {emotion['label']}] {user_text}"}]
         return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId), media_type="text/event-stream")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")

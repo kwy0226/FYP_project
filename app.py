@@ -2,12 +2,20 @@ import os
 import base64
 import time
 import json
+import logging
+import traceback
 from typing import Optional, List, Dict, Iterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+# =======================================================
+# Logging（让 Cloud Run 能看到真实报错）
+# =======================================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("emotion-api")
 
 # =======================================================
 # Hugging Face 缓存目录
@@ -50,9 +58,9 @@ _openai_client = None
 if OPENAI_API_KEY:
     try:
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        print("[OpenAI] Client initialized")
+        log.info("[OpenAI] Client initialized")
     except Exception as e:
-        print("[OpenAI init error]", e)
+        log.exception("[OpenAI init error] %s", e)
 
 # Firebase init
 if not firebase_admin._apps:
@@ -65,9 +73,9 @@ if not firebase_admin._apps:
                 cred,
                 {"databaseURL": os.getenv("FIREBASE_URL", "")},
             )
-            print("[Firebase] Initialized")
+            log.info("[Firebase] Initialized")
         except Exception as e:
-            print("[Firebase init error]", e)
+            log.exception("[Firebase init error] %s", e)
 
 # =======================================================
 # FastAPI app
@@ -113,14 +121,14 @@ class ChatPayload(BaseModel):
 
 
 # =======================================================
-# Models (情绪分类用多类模型)
+# Models（细分类）
 # =======================================================
-TXT_MODEL_EN = "j-hartmann/emotion-english-distilroberta-base"         # 7 类
+TXT_MODEL_EN = "j-hartmann/emotion-english-distilroberta-base"         # 7类
 TXT_MODEL_ZH = "uer/roberta-base-finetuned-chinanews-chinese-emotion"  # 多类
 _TXT_MODELS: dict[str, dict] = {}
 
-# 语音情绪：改用 Hugging Face 模型（取代 speechbrain，避免 compute_features 报错）
-AUDIO_EMO_MODEL = "superb/hubert-large-superb-er"  # 16k 采样
+# 语音情绪：使用 HF 模型，取代 speechbrain
+AUDIO_EMO_MODEL = "superb/hubert-large-superb-er"  # 16kHz
 _AUDIO_EMO: Dict[str, object] = {}
 
 # =======================================================
@@ -140,6 +148,7 @@ def _load_text_model_once(key: str, model_name: str):
     except Exception:
         labels = ["neutral", "happy", "sad", "angry"]
     _TXT_MODELS[key] = {"tok": tok, "mdl": mdl, "labels": labels}
+    log.info("[TEXT] loaded %s", model_name)
 
 
 def _pick_text_model_by_lang(text: str):
@@ -167,6 +176,7 @@ def _ensure_audio_emo():
     _AUDIO_EMO["processor"] = processor
     _AUDIO_EMO["model"] = model
     _AUDIO_EMO["labels"] = labels
+    log.info("[AUDIO] loaded %s", AUDIO_EMO_MODEL)
 
 # =======================================================
 # Helpers
@@ -193,7 +203,6 @@ def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict)
     ref.update({"emotion": emotion})
 
 def _push_reply_part(uid: str, chatId: str, msgId: str, content: str, part_idx: int):
-    """把一小段回复 push 到 aiReplyParts，供前端一条条显示"""
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}").child("aiReplyParts")
@@ -207,7 +216,6 @@ def _push_reply_part(uid: str, chatId: str, msgId: str, content: str, part_idx: 
     })
 
 def _write_full_reply(uid: str, chatId: str, msgId: str, reply: str):
-    """可选：把完整拼接结果也写入 aiReply（便于检索/回放）"""
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
@@ -220,18 +228,16 @@ def _write_full_reply(uid: str, chatId: str, msgId: str, reply: str):
         }
     })
 
-def _sse(data: str) -> bytes:
-    """SSE 标准帧：data: ...\\n\\n（客户端/Flutter 才能稳定解析）"""
-    return f"data: {data}\n\n".encode("utf-8")
+def _sse(data_obj: Dict) -> bytes:
+    return f"data: {json.dumps(data_obj, ensure_ascii=False)}\n\n".encode("utf-8")
 
 def _segment_ready(buf: str) -> bool:
-    """遇到句末标点或达到长度阈值就切一段"""
     if any(p in buf for p in ["。", "！", "？", ".", "!", "?"]):
         return True
-    return len(buf) >= 50  # 兜底长度
+    return len(buf) >= 60  # 兜底长度，避免卡住
 
 # =======================================================
-# Character Profile Refinement
+# Character Profile Refinement（保持你原来的能力）
 # =======================================================
 def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
     user_agent = "EmotionMate/1.0"
@@ -303,7 +309,7 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
         "你正在严格扮演这个角色，不要跳出角色。",
         "必须用第一人称说话，让对话自然沉浸。",
         "不要包含 AI 身份、免责声明或任何元信息。",
-        "每个回复像真人一样简短自然：分 2–3 段，每段 1–2 句，总字数≦80。",
+        "每个回复像真人一样简短自然：分 2–3 段，每段 1–2 句，总字数≤80。",
     ]
     if name: lines.append(f"名字: {name}")
     if gender: lines.append(f"性别: {gender}")
@@ -339,6 +345,7 @@ def text_emotion(p: TextPayload):
         _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
         return result
     except Exception as e:
+        log.exception("text_emotion error")
         raise HTTPException(status_code=500, detail=f"text inference error: {e}")
 
 @app.post("/audio/emotion")
@@ -348,7 +355,7 @@ def audio_emotion(p: AudioPayload):
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
         wav, sr = torchaudio.load(wav_path)
         os.remove(wav_path)
-        # 转单声道 & 重采样到 16k
+        # 单声道 & 16k
         if wav.shape[0] > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
         if sr != 16000:
@@ -375,11 +382,11 @@ def audio_emotion(p: AudioPayload):
         _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
         return result
     except Exception as e:
+        log.exception("audio_emotion error")
         raise HTTPException(status_code=500, detail=f"audio inference error: {e}")
 
 # === SSE 流（逐条消息 + Firebase push）===
 def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str) -> Iterator[bytes]:
-    """同步生成器即可，OpenAI流也是同步迭代；按段 push 到 Firebase + SSE 发到前端"""
     full_reply = []
     try:
         stream = _openai_client.chat.completions.create(
@@ -392,7 +399,10 @@ def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str) -> Ite
         buf = ""
         part_idx = 0
         for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
+            try:
+                delta = chunk.choices[0].delta.content or ""
+            except Exception:
+                delta = ""
             if not delta:
                 continue
             buf += delta
@@ -402,43 +412,66 @@ def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str) -> Ite
                 if part:
                     part_idx += 1
                     full_reply.append(part)
-                    _push_reply_part(uid, chatId, msgId, part, part_idx)
-                    # SSE：传回 JSON，前端更好解析
-                    yield _sse(json.dumps({"type": "chunk", "part": part_idx, "content": part}))
+                    # 写 Firebase 单独的段落消息
+                    try:
+                        _push_reply_part(uid, chatId, msgId, part, part_idx)
+                    except Exception:
+                        log.exception("push part to firebase failed")
+                    # SSE 发给前端
+                    yield _sse({"type": "chunk", "part": part_idx, "content": part})
         if buf.strip():
             part_idx += 1
             full_reply.append(buf.strip())
-            _push_reply_part(uid, chatId, msgId, buf.strip(), part_idx)
-            yield _sse(json.dumps({"type": "chunk", "part": part_idx, "content": buf.strip()}))
+            try:
+                _push_reply_part(uid, chatId, msgId, buf.strip(), part_idx)
+            except Exception:
+                log.exception("push last part to firebase failed")
+            yield _sse({"type": "chunk", "part": part_idx, "content": buf.strip()})
 
         # 可选：写完整文本
         final_text = " ".join(full_reply)
-        _write_full_reply(uid, chatId, msgId, final_text)
-        yield _sse(json.dumps({"type": "done"}))
+        try:
+            _write_full_reply(uid, chatId, msgId, final_text)
+        except Exception:
+            log.exception("write full reply failed")
+
+        yield _sse({"type": "done"})
     except Exception as e:
-        yield _sse(json.dumps({"type": "error", "message": str(e)}))
+        log.exception("stream_chat error")
+        # 不抛异常，避免 500；把错误通过 SSE 推给前端
+        yield _sse({"type": "error", "message": str(e)})
 
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
     try:
-        # 文本情绪（细分）
+        # 文字情绪（细分）
         if p.uid and p.chatId and p.msgId:
-            emo_result = text_emotion(TextPayload(text=p.message, uid=p.uid, chatId=p.chatId, msgId=p.msgId))
-            ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
-            ref.update({"emotion": emo_result})
+            try:
+                emo_result = text_emotion(TextPayload(text=p.message, uid=p.uid, chatId=p.chatId, msgId=p.msgId))
+                ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
+                ref.update({"emotion": emo_result})
+            except Exception:
+                log.exception("write text emotion failed")
 
         # 角色资料
         if p.uid and p.aiName:
-            _upsert_user_character_profile(
-                uid=p.uid, char_id=p.chatId,
-                ai_name=p.aiName, ai_gender=p.aiGender, ai_background=p.aiBackground,
-            )
+            try:
+                _upsert_user_character_profile(
+                    uid=p.uid, char_id=p.chatId,
+                    ai_name=p.aiName, ai_gender=p.aiGender, ai_background=p.aiBackground,
+                )
+            except Exception:
+                log.exception("upsert character profile failed")
 
         # 系统提示
-        ref = db.reference(f"character/{p.uid}/{p.chatId}")
-        profile = ref.get() or {}
+        try:
+            ref = db.reference(f"character/{p.uid}/{p.chatId}")
+            profile = ref.get() or {}
+        except Exception:
+            log.exception("read character profile failed")
+            profile = {}
         sys_prompt = _build_roleplay_system_prompt(profile)
 
         msgs = [{"role": "system", "content": sys_prompt}]
@@ -449,12 +482,12 @@ def chat_reply(p: ChatPayload):
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
         }
         return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId),
                                  media_type="text/event-stream",
                                  headers=headers)
     except Exception as e:
+        log.exception("chat_reply error")
         raise HTTPException(status_code=500, detail=f"chat_reply error: {e}")
 
 @app.post("/audio/process")
@@ -500,11 +533,14 @@ def audio_process(p: AudioPayload):
 
         # 写入原消息节点（文本+情绪）
         if p.uid and p.chatId and p.msgId:
-            ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
-            ref.update({"text": user_text, "emotion": emotion})
+            try:
+                ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
+                ref.update({"text": user_text, "emotion": emotion})
+            except Exception:
+                log.exception("write audio text/emotion failed")
 
         # 生成回复（同样走 SSE 流，分条 push）
-        sys_prompt = "你是一个有同理心的情感支持助手。回复像真人说话，分成 2–3 段，每段 1–2 句，总体≦80 字。"
+        sys_prompt = "你是一个有同理心的情感支持助手。回复像真人说话，分成 2–3 段，每段 1–2 句，总体≤80 字。"
         msgs = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": f"[Emotion: {emotion['label']}] {user_text}"}
@@ -512,10 +548,10 @@ def audio_process(p: AudioPayload):
         headers = {
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
         }
         return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId),
                                  media_type="text/event-stream",
                                  headers=headers)
     except Exception as e:
+        log.exception("audio_process error")
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")

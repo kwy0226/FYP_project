@@ -4,7 +4,7 @@ import time
 import json
 import logging
 import traceback
-from typing import Optional, List, Dict, Iterator
+from typing import Optional, List, Dict, Iterator, Iterable
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,8 +30,8 @@ import torchaudio
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    AutoProcessor,
-    AutoModelForAudioClassification,
+    AutoFeatureExtractor,            # ✅ 用于音频特征
+    AutoModelForAudioClassification, # ✅ 语音情绪
 )
 
 # language detection
@@ -51,8 +51,10 @@ from firebase_admin import credentials, db
 # Init
 # =======================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# GPT-4o/4o-mini 等多模态模型
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
+# 尝试直接把音频丢给 GPT（Responses API）；失败则自动回退到转写
+ENABLE_GPT_AUDIO = os.getenv("ENABLE_GPT_AUDIO", "1")  # "1" 开启；其他值关闭
 
 _openai_client = None
 if OPENAI_API_KEY:
@@ -123,11 +125,12 @@ class ChatPayload(BaseModel):
 # =======================================================
 # Models
 # =======================================================
+# 文本情绪：细粒度
 TXT_MODEL_EN = "SamLowe/roberta-base-go_emotions"           # 英文：28类
 TXT_MODEL_ZH = "uer/roberta-base-finetuned-weibo-chinese"   # 中文：多情绪
 _TXT_MODELS: dict[str, dict] = {}
 
-# 语音情绪模型
+# 语音情绪模型（7类）
 AUDIO_EMO_MODEL = "superb/hubert-large-superb-er"
 _AUDIO_EMO: Dict[str, object] = {}
 
@@ -167,13 +170,13 @@ def _pick_text_model_by_lang(text: str):
 def _ensure_audio_emo():
     if _AUDIO_EMO:
         return
-    processor = AutoProcessor.from_pretrained(AUDIO_EMO_MODEL)
+    extractor = AutoFeatureExtractor.from_pretrained(AUDIO_EMO_MODEL)  # ✅ 关键修复
     model = AutoModelForAudioClassification.from_pretrained(AUDIO_EMO_MODEL)
     model.eval()
     if torch.cuda.is_available():
         model.to("cuda")
     labels = [model.config.id2label[i] for i in range(len(model.config.id2label))]
-    _AUDIO_EMO["processor"] = processor
+    _AUDIO_EMO["extractor"] = extractor
     _AUDIO_EMO["model"] = model
     _AUDIO_EMO["labels"] = labels
     log.info("[AUDIO] loaded %s", AUDIO_EMO_MODEL)
@@ -234,10 +237,10 @@ def _sse(data_obj: Dict) -> bytes:
 def _segment_ready(buf: str) -> bool:
     if any(p in buf for p in ["。", "！", "？", ".", "!", "?"]):
         return True
-    return len(buf) >= 60
+    return len(buf) >= 60  # 兜底长度
 
 # =======================================================
-# Character Profile Refinement
+# Character Profile Refinement（保留）
 # =======================================================
 def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
     user_agent = "EmotionMate/1.0"
@@ -319,96 +322,94 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
     return "\n".join(lines)
 
 # =======================================================
-# Routes
+# OpenAI 统一增量文本迭代器 + SSE 包装
 # =======================================================
-@app.get("/")
-def root():
-    return {"status": "ok", "msg": "Emotion API root is alive"}
+def _delta_iter_chat(messages: List[Dict]) -> Iterable[str]:
+    """chat.completions 流，产出文本增量"""
+    stream = _openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=0.8,
+        max_tokens=400,
+        stream=True,
+    )
+    for chunk in stream:
+        try:
+            delta = chunk.choices[0].delta.content or ""
+        except Exception:
+            delta = ""
+        if delta:
+            yield delta
 
+def _delta_iter_audio_with_fallback(wav_path: str, emotion_label: str) -> Iterable[str]:
+    """
+    优先使用 Responses API 直接理解音频；
+    不可用则自动回退到 Whisper 转写 + 文本对话。
+    """
+    # 尝试 Responses API（多模态）
+    if ENABLE_GPT_AUDIO == "1":
+        try:
+            with open(wav_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+            # Responses Streaming
+            stream = _openai_client.responses.create(
+                model=OPENAI_MODEL,
+                stream=True,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text",
+                             "text": f"收到一段语音。用户当前情绪：{emotion_label}。请用同理心、口语化、简短的方式回复。分2–3段，每段1–2句，总字数≤80。"},
+                            {"type": "input_audio",
+                             "audio": {"data": b64, "format": "wav"}}
+                        ],
+                    }
+                ],
+            )
+            # 逐事件产出文本增量
+            for event in stream:
+                # 官方 SDK 事件类型：response.output_text.delta / response.error / response.completed 等
+                et = getattr(event, "type", None)
+                if et == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    if delta:
+                        yield delta
+                elif et == "response.error":
+                    err = getattr(event, "error", "")
+                    log.error("Responses stream error: %s", err)
+                elif et in ("response.completed", "response.done"):
+                    break
+            return
+        except Exception:
+            log.exception("Responses API audio path failed, fallback to transcription")
 
-@app.post("/nlp/text-emotion")
-def text_emotion(p: TextPayload):
+    # 回退：转写 -> 文本对话
     try:
-        bundle = _pick_text_model_by_lang(p.text)
-        tok, mdl, labels = bundle["tok"], bundle["mdl"], bundle["labels"]
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        inputs = tok(p.text, return_tensors="pt", truncation=True, max_length=512)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = mdl(**inputs)
-            probs = _softmax(outputs.logits)[0].detach().cpu().tolist()
-        idx = int(torch.tensor(probs).argmax().item())
-        result = {
-            "label": labels[idx],
-            "confidence": float(probs[idx]),
-            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))},
-            "used_model": mdl.name_or_path,
-        }
-        _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
-        return result
-    except Exception as e:
-        log.exception("text_emotion error")
-        raise HTTPException(status_code=500, detail=f"text inference error: {e}")
+        with open(wav_path, "rb") as f:
+            transcript = _openai_client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe", file=f
+            )
+        user_text = (transcript.text or "").strip() or "（语音内容未能识别）"
+    except Exception:
+        log.exception("Transcription failed, use placeholder text")
+        user_text = "（语音内容无法转写）"
 
+    messages = [
+        {"role": "system", "content":
+            "你是一个有同理心的情感支持助手。像真人一样说话：分成 2–3 段，每段 1–2 句，总字数≤80。"},
+        {"role": "user", "content": f"[Emotion: {emotion_label}] {user_text}"}
+    ]
+    yield from _delta_iter_chat(messages)
 
-@app.post("/audio/emotion")
-def audio_emotion(p: AudioPayload):
+def _sse_stream_from_deltas(delta_iter: Iterable[str],
+                            uid: str, chatId: str, msgId: str) -> Iterator[bytes]:
+    """把任意增量文本转换成 SSE + Firebase 分段 & 全文写入"""
+    full_reply: List[str] = []
+    buf = ""
+    part_idx = 0
     try:
-        _ensure_audio_emo()
-        wav_path = _base64_wav_to_tmpfile(p.wav_base64)
-        wav, sr = torchaudio.load(wav_path)
-        os.remove(wav_path)
-        # 单声道 & 16k
-        if wav.shape[0] > 1:
-            wav = torch.mean(wav, dim=0, keepdim=True)
-        if sr != 16000:
-            wav = torchaudio.functional.resample(wav, sr, 16000)
-            sr = 16000
-
-        processor = _AUDIO_EMO["processor"]
-        model: AutoModelForAudioClassification = _AUDIO_EMO["model"]
-        labels: List[str] = _AUDIO_EMO["labels"]
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        inputs = processor(wav.squeeze().numpy(), sampling_rate=sr, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = _softmax(logits)[0].detach().cpu().tolist()
-        idx = int(torch.tensor(probs).argmax().item())
-
-        result = {
-            "label": labels[idx],
-            "confidence": float(probs[idx]),
-            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))}
-        }
-        _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
-        return result
-    except Exception as e:
-        log.exception("audio_emotion error")
-        raise HTTPException(status_code=500, detail=f"audio inference error: {e}")
-
-
-# === SSE 流（逐条消息 + Firebase push）===
-def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str) -> Iterator[bytes]:
-    full_reply = []
-    try:
-        stream = _openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            temperature=0.8,
-            max_tokens=400,
-            stream=True,
-        )
-        buf = ""
-        part_idx = 0
-        for chunk in stream:
-            try:
-                delta = chunk.choices[0].delta.content or ""
-            except Exception:
-                delta = ""
-            if not delta:
-                continue
+        for delta in delta_iter:
             buf += delta
             if _segment_ready(buf):
                 part = buf.strip()
@@ -437,16 +438,87 @@ def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str) -> Ite
             log.exception("write full reply failed")
 
         yield _sse({"type": "done"})
-    except Exception as e:
-        log.exception("stream_chat error")
-        yield _sse({"type": "error", "message": str(e)})
+    except Exception:
+        log.exception("sse_stream_from_deltas error")
+        yield _sse({"type": "error", "message": "stream failed"})
 
+# =======================================================
+# Routes
+# =======================================================
+@app.get("/")
+def root():
+    return {"status": "ok", "msg": "Emotion API root is alive"}
+
+@app.post("/nlp/text-emotion")
+def text_emotion(p: TextPayload):
+    try:
+        bundle = _pick_text_model_by_lang(p.text)
+        tok, mdl, labels = bundle["tok"], bundle["mdl"], bundle["labels"]
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        inputs = tok(p.text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = mdl(**inputs)
+            probs = _softmax(outputs.logits)[0].detach().cpu().tolist()
+        idx = int(torch.tensor(probs).argmax().item())
+        result = {
+            "label": labels[idx],
+            "confidence": float(probs[idx]),
+            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))},
+            "used_model": mdl.name_or_path,
+        }
+        _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
+        return result
+    except Exception as e:
+        log.exception("text_emotion error")
+        raise HTTPException(status_code=500, detail=f"text inference error: {e}")
+
+@app.post("/audio/emotion")
+def audio_emotion(p: AudioPayload):
+    """保留这个调试接口：仅返回语音 SER 结果"""
+    try:
+        _ensure_audio_emo()
+        wav_path = _base64_wav_to_tmpfile(p.wav_base64)
+        wav, sr = torchaudio.load(wav_path)
+        os.remove(wav_path)
+        # 单声道 & 16k
+        if wav.shape[0] > 1:
+            wav = torch.mean(wav, dim=0, keepdim=True)
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+            sr = 16000
+
+        extractor = _AUDIO_EMO["extractor"]
+        model: AutoModelForAudioClassification = _AUDIO_EMO["model"]
+        labels: List[str] = _AUDIO_EMO["labels"]
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        inputs = extractor(wav.squeeze().numpy(), sampling_rate=sr, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = model(**inputs).logits
+            probs = _softmax(logits)[0].detach().cpu().tolist()
+        idx = int(torch.tensor(probs).argmax().item())
+
+        result = {
+            "label": labels[idx],
+            "confidence": float(probs[idx]),
+            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))},
+            "used_model": AUDIO_EMO_MODEL,
+        }
+        _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
+        return result
+    except Exception as e:
+        log.exception("audio_emotion error")
+        raise HTTPException(status_code=500, detail=f"audio inference error: {e}")
+
+# === Chat SSE（文字消息）
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
     try:
-        # 文字情绪识别
+        # 文字情绪识别（细分）并写库
         if p.uid and p.chatId and p.msgId:
             try:
                 emo_result = text_emotion(TextPayload(text=p.message, uid=p.uid, chatId=p.chatId, msgId=p.msgId))
@@ -455,7 +527,7 @@ def chat_reply(p: ChatPayload):
             except Exception:
                 log.exception("write text emotion failed")
 
-        # 更新角色资料
+        # 更新角色资料（保留）
         if p.uid and p.aiName:
             try:
                 _upsert_user_character_profile(
@@ -465,7 +537,7 @@ def chat_reply(p: ChatPayload):
             except Exception:
                 log.exception("upsert character profile failed")
 
-        # 获取角色 Profile
+        # 读取角色 Profile
         try:
             ref = db.reference(f"character/{p.uid}/{p.chatId}")
             profile = ref.get() or {}
@@ -473,88 +545,76 @@ def chat_reply(p: ChatPayload):
             log.exception("read character profile failed")
             profile = {}
 
-        # 系统提示（让角色更像真人）
         sys_prompt = _build_roleplay_system_prompt(profile)
 
-        msgs = [{"role": "system", "content": sys_prompt}]
+        messages = [{"role": "system", "content": sys_prompt}]
         if p.history:
-            msgs.extend(p.history)
-        msgs.append({"role": "user", "content": p.message})
+            messages.extend(p.history)
+        messages.append({"role": "user", "content": p.message})
 
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-        return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId),
-                                 media_type="text/event-stream",
-                                 headers=headers)
+        headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        return StreamingResponse(
+            _sse_stream_from_deltas(_delta_iter_chat(messages), p.uid, p.chatId, p.msgId),
+            media_type="text/event-stream",
+            headers=headers
+        )
     except Exception as e:
         log.exception("chat_reply error")
         raise HTTPException(status_code=500, detail=f"chat_reply error: {e}")
 
-
+# === 语音：SER -> (优先) 直接把音频 + 情绪交给 GPT -> SSE
 @app.post("/audio/process")
 def audio_process(p: AudioPayload):
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
     try:
-        # Step 1: 语音转文字
-        wav_path = _base64_wav_to_tmpfile(p.wav_base64)
-        with open(wav_path, "rb") as f:
-            transcript = _openai_client.audio.transcriptions.create(
-                model=OPENAI_TRANSCRIBE_MODEL, file=f
-            )
-        user_text = (transcript.text or "").strip()
-
-        # Step 2: 语音情绪识别
         _ensure_audio_emo()
+        wav_path = _base64_wav_to_tmpfile(p.wav_base64)
         wav, sr = torchaudio.load(wav_path)
-        os.remove(wav_path)
+        # 单声道 & 16k
         if wav.shape[0] > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
         if sr != 16000:
             wav = torchaudio.functional.resample(wav, sr, 16000)
             sr = 16000
-
-        processor = _AUDIO_EMO["processor"]
+        # 先做 SER
+        extractor = _AUDIO_EMO["extractor"]
         model: AutoModelForAudioClassification = _AUDIO_EMO["model"]
         labels: List[str] = _AUDIO_EMO["labels"]
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        inputs = processor(wav.squeeze().numpy(), sampling_rate=sr, return_tensors="pt")
+        inputs = extractor(wav.squeeze().numpy(), sampling_rate=sr, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
             logits = model(**inputs).logits
             probs = _softmax(logits)[0].detach().cpu().tolist()
         idx = int(torch.tensor(probs).argmax().item())
-
         emotion = {
             "label": labels[idx],
             "confidence": float(probs[idx]),
-            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))}
+            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))},
+            "used_model": AUDIO_EMO_MODEL,
         }
-
-        # Step 3: 写入 Firebase 原始消息（文本+情绪）
+        # 写入消息节点（仅情绪；不强制保存文本）
         if p.uid and p.chatId and p.msgId:
             try:
                 ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
-                ref.update({"text": user_text, "emotion": emotion})
+                ref.update({"emotion": emotion, "type": "audio"})
             except Exception:
-                log.exception("write audio text/emotion failed")
+                log.exception("write audio emotion failed")
 
-        # Step 4: 生成回复（SSE 流式输出）
-        sys_prompt = "你是一个有同理心的情感支持助手。你要像真人一样说话：分成 2–3 段，每段 1–2 句，总字数≤80。保持自然、有人情味。"
-        msgs = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"[Emotion: {emotion['label']}] {user_text}"}
-        ]
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-        return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId),
-                                 media_type="text/event-stream",
-                                 headers=headers)
+        headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        # 语音直接丢 GPT（可理解音频）；如果失败自动回退到转写 → 文本对话
+        stream = _sse_stream_from_deltas(
+            _delta_iter_audio_with_fallback(wav_path, emotion["label"]),
+            p.uid, p.chatId, p.msgId
+        )
+        # 清理
+        try:
+            os.remove(wav_path)
+        except Exception:
+            pass
+
+        return StreamingResponse(stream, media_type="text/event-stream", headers=headers)
     except Exception as e:
         log.exception("audio_process error")
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")

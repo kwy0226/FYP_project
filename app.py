@@ -2,10 +2,12 @@ import os
 import base64
 import time
 import json
+import uuid
 from typing import Optional, List, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # =======================================================
@@ -39,6 +41,7 @@ from firebase_admin import credentials, db
 # =======================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
 
 _openai_client = None
 if OPENAI_API_KEY:
@@ -48,7 +51,7 @@ if OPENAI_API_KEY:
     except Exception as e:
         print("[OpenAI init error]", e)
 
-# Firebase init (用环境变量 JSON)
+# Firebase init
 if not firebase_admin._apps:
     cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
     if cred_json:
@@ -59,7 +62,7 @@ if not firebase_admin._apps:
                 cred,
                 {"databaseURL": os.getenv("FIREBASE_URL", "")},
             )
-            print("[Firebase] Initialized from FIREBASE_CREDENTIALS_JSON")
+            print("[Firebase] Initialized")
         except Exception as e:
             print("[Firebase init error]", e)
 
@@ -70,10 +73,8 @@ app = FastAPI(title="Emotion API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dev only
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 # =======================================================
@@ -162,12 +163,10 @@ def _ensure_speech_model():
 def _softmax(logits: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.softmax(logits, dim=-1)
 
-
 def _strip_data_url_prefix(b64: str) -> str:
     if "," in b64 and "base64" in b64[:64]:
         return b64.split(",", 1)[1]
     return b64
-
 
 def _base64_wav_to_tmpfile(b64: str) -> str:
     raw = base64.b64decode(_strip_data_url_prefix(b64), validate=True)
@@ -176,13 +175,11 @@ def _base64_wav_to_tmpfile(b64: str) -> str:
         f.write(raw)
     return path
 
-
 def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict):
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
     ref.update({"emotion": emotion})
-
 
 def _write_reply_to_firebase(uid: str, chatId: str, msgId: str, reply: str):
     if not uid or not chatId or not msgId:
@@ -197,13 +194,11 @@ def _write_reply_to_firebase(uid: str, chatId: str, msgId: str, reply: str):
         }
     })
 
-
 # =======================================================
 # Character Profile Refinement
 # =======================================================
 def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
-    """补全资料 + 自动生成 Personality"""
-    user_agent = "EmotionMate/1.0 (wkyeoh0226@gmail.com)"
+    user_agent = "EmotionMate/1.0"
     wiki_zh = wikipediaapi.Wikipedia(user_agent=user_agent, language="zh")
     wiki_en = wikipediaapi.Wikipedia(user_agent=user_agent, language="en")
 
@@ -213,7 +208,6 @@ def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
         page = wiki_en.page(ai_name.strip())
         if page.exists():
             summary = page.summary[0:800]
-            # 翻译成中文
             resp = _openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -229,12 +223,11 @@ def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
     if summary:
         full_bg += "\n\n[补全资料] " + summary
 
-    # 提炼性格 + 背景
     resp2 = _openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": "你是一个角色分析专家。"},
-            {"role": "user", "content": f"以下是角色 {ai_name} 的背景资料：\n{full_bg}\n\n请帮我总结：\n1. 角色的性格特点（简洁中文描述）。\n2. 精炼一个适合 Roleplay 的背景描述。"}
+            {"role": "user", "content": f"以下是角色 {ai_name} 的背景资料：\n{full_bg}\n\n请帮我总结：\n1. 角色的性格特点。\n2. 精炼一个适合 Roleplay 的背景描述。"}
         ]
     )
     result_text = resp2.choices[0].message.content.strip()
@@ -244,25 +237,16 @@ def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
         "aiPersonality": result_text
     }
 
-
-def _upsert_user_character_profile(
-    uid: str,
-    char_id: str,
-    ai_name: Optional[str],
-    ai_gender: Optional[str],
-    ai_background: Optional[str],
-):
+def _upsert_user_character_profile(uid: str, char_id: str, ai_name: Optional[str],
+                                   ai_gender: Optional[str], ai_background: Optional[str]):
     if not uid or not char_id or not ai_name:
         return
-
     now_ts = int(time.time() * 1000)
     ref = db.reference(f"character/{uid}/{char_id}")
     snap = ref.get() or {}
-
     enriched = {}
     if ai_background:
         enriched = _refine_character_profile(ai_name, ai_background)
-
     updates = {
         "aiName": ai_name or snap.get("aiName", ""),
         "aiGender": ai_gender or snap.get("aiGender", ""),
@@ -270,25 +254,19 @@ def _upsert_user_character_profile(
         "aiPersonality": enriched.get("aiPersonality", snap.get("aiPersonality", "")),
         "updatedAt": now_ts,
     }
-
     if not snap:
         updates["createdAt"] = now_ts
-
     ref.update(updates)
 
-
 def _build_roleplay_system_prompt(profile: Dict) -> str:
-    """基于数据库中的角色资料构造 Roleplay Prompt"""
     name = (profile.get("aiName") or "").strip()
     gender = (profile.get("aiGender") or "").strip()
     personality = (profile.get("aiPersonality") or "").strip()
     background = (profile.get("aiBackground") or "").strip()
-
     lines = [
         "你正在严格扮演这个角色，不要跳出角色。",
         "必须用第一人称说话，让对话自然沉浸。",
         "不要包含 AI 身份、免责声明或任何元信息。",
-        "",
         f"名字: {name}" if name else "",
         f"性别: {gender}" if gender else "",
         f"性格: {personality}" if personality else "",
@@ -296,14 +274,12 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
     ]
     return "\n".join([ln for ln in lines if ln])
 
-
 # =======================================================
 # Chat + Emotion Routes
 # =======================================================
 @app.get("/")
 def root():
     return {"status": "ok", "msg": "Emotion API root is alive"}
-
 
 @app.post("/nlp/text-emotion")
 def text_emotion(p: TextPayload):
@@ -317,21 +293,21 @@ def text_emotion(p: TextPayload):
             outputs = mdl(**inputs)
             probs = _softmax(outputs.logits)[0].cpu().tolist()
         idx = int(torch.tensor(probs).argmax().item())
-        raw_label = labels[idx].lower()
-        mapping = {"neg": "negative", "negative": "negative",
-                   "neu": "neutral", "neutral": "neutral",
-                   "pos": "positive", "positive": "positive"}
-        std_label = mapping.get(raw_label, raw_label)
+
+        # 🔑 这里不再做 Positive/Negative 映射，而是保留原始标签
+        raw_label = labels[idx]
+        std_label = raw_label
+
         result = {
             "label": std_label,
             "confidence": float(probs[idx]),
+            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))},
             "used_model": mdl.name_or_path,
         }
         _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"text inference error: {e}")
-
 
 @app.post("/audio/emotion")
 def audio_emotion(p: AudioPayload):
@@ -342,144 +318,102 @@ def audio_emotion(p: AudioPayload):
         if sr != 16000:
             wav = torchaudio.functional.resample(wav, sr, 16000)
             torchaudio.save(wav_path, wav, 16000)
-
-        out = _SPEECH_EMO.classify_file(wav_path)
+        out_probs, out_classes = _SPEECH_EMO.classify_batch(wav)
+        predicted_index = out_classes[0].item()
+        label = _SPEECH_EMO.hparams.label_encoder.decode_torch(torch.tensor([predicted_index]))[0]
+        scores = out_probs.squeeze().detach().cpu().tolist()
+        classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(torch.arange(len(scores)))
         os.remove(wav_path)
-
-        label = out["predicted_label"]
-        result = {"label": str(label), "model": SPEECH_MODEL_NAME}
+        result = {
+            "label": str(label),
+            "confidence": float(max(scores)),
+            "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))}
+        }
         _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio inference error: {e}")
 
+# === 修改点：流式回复函数 ===
+async def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str):
+    full_reply = ""
+    try:
+        stream = _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.7,
+            stream=True
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            if delta:
+                full_reply += delta
+                # 遇到 ⎋ 就分段输出
+                parts = delta.split("⎋")
+                for part in parts:
+                    if part.strip():
+                        yield part
+        _write_reply_to_firebase(uid, chatId, msgId, full_reply)
+    except Exception as e:
+        yield f"(error: {e})"
 
+# === 修改点：chat/reply 流式分段 ===
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:
         return {"reply": "(AI disabled)"}
-
     if p.uid and p.chatId and p.msgId:
         emo_result = text_emotion(TextPayload(text=p.message, uid=p.uid, chatId=p.chatId, msgId=p.msgId))
         ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
         ref.update({"emotion": emo_result})
-
     if p.uid and p.aiName:
         _upsert_user_character_profile(
-            uid=p.uid,
-            char_id=p.chatId,
-            ai_name=p.aiName,
-            ai_gender=p.aiGender,
-            ai_background=p.aiBackground,
+            uid=p.uid, char_id=p.chatId,
+            ai_name=p.aiName, ai_gender=p.aiGender, ai_background=p.aiBackground,
         )
-
     ref = db.reference(f"character/{p.uid}/{p.chatId}")
     profile = ref.get() or {}
-    sys_prompt = _build_roleplay_system_prompt(profile)
-
+    sys_prompt = _build_roleplay_system_prompt(profile) + "\n规则: 回复分成2-3段, 每段用 ⎋ 分隔, 简短自然。"
     msgs = [{"role": "system", "content": sys_prompt}]
     if p.history:
         msgs.extend(p.history)
     msgs.append({"role": "user", "content": p.message})
+    return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId), media_type="text/event-stream")
 
-    try:
-        resp = _openai_client.chat.completions.create(
-            model=OPENAI_MODEL, messages=msgs, temperature=0.7,
-        )
-        reply = resp.choices[0].message.content
-        _write_reply_to_firebase(p.uid, p.chatId, p.msgId, reply)
-        return {"reply": reply}
-    except Exception as e:
-        _write_reply_to_firebase(p.uid, p.chatId, p.msgId, "(error)")
-        return {"reply": "(error)", "error": str(e)}
-
-
+# === 修改点：audio/process 流式分段 ===
 @app.post("/audio/process")
 def audio_process(p: AudioPayload):
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
-
     try:
-        print("[audio_process] === START ===")
-        print("[audio_process] payload length:", len(p.wav_base64) if p.wav_base64 else 0)
-
-        # 保存临时 wav 文件
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
-        print("[audio_process] temp wav saved:", wav_path)
-
-        # 调用 OpenAI 语音转写
         with open(wav_path, "rb") as f:
-            print("[audio_process] sending file to OpenAI transcription...")
             transcript = _openai_client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f
+                model=OPENAI_TRANSCRIBE_MODEL, file=f
             )
         user_text = transcript.text.strip()
-        print("[audio_process] transcription result:", user_text)
-
-        # ================= SpeechBrain 情绪识别（新版 classify_batch） =================
         _ensure_speech_model()
-        print("[audio_process] running SpeechBrain classifier...")
-
         wav, sr = torchaudio.load(wav_path)
         if sr != 16000:
             wav = torchaudio.functional.resample(wav, sr, 16000)
             sr = 16000
-
         out_probs, out_classes = _SPEECH_EMO.classify_batch(wav)
-        print("[audio_process] speechbrain raw output:", out_probs, out_classes)
-
         predicted_index = out_classes[0].item()
-        label = _SPEECH_EMO.hparams.label_encoder.decode_torch(
-            torch.tensor([predicted_index])
-        )[0]
-
+        label = _SPEECH_EMO.hparams.label_encoder.decode_torch(torch.tensor([predicted_index]))[0]
         scores = out_probs.squeeze().detach().cpu().tolist()
-        classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(
-            torch.arange(len(scores))
-        )
-
+        classes = _SPEECH_EMO.hparams.label_encoder.decode_ndim(torch.arange(len(scores)))
         emotion = {
             "label": str(label),
             "confidence": float(max(scores)),
-            "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))},
+            "probs": {str(classes[i]): float(scores[i]) for i in range(len(scores))}
         }
-        print("[audio_process] final emotion dict:", emotion)
-
-        # 删除临时文件
         os.remove(wav_path)
-
-        # 写入 Firebase
         if p.uid and p.chatId and p.msgId:
             ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
             ref.update({"text": user_text, "emotion": emotion})
-            print("[audio_process] firebase updated")
-
-        # 构建对话消息并调用 OpenAI
-        msgs = [{"role": "user", "content": f"[Emotion hint: {emotion}] {user_text}"}]
-        print("[audio_process] sending chat completion with msgs:", msgs)
-
-        resp = _openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=msgs,
-            temperature=0.7,
-        )
-        reply = resp.choices[0].message.content
-        print("[audio_process] reply from OpenAI:", reply)
-
-        _write_reply_to_firebase(p.uid, p.chatId, p.msgId, reply)
-        print("[audio_process] reply written to firebase")
-
-        print("[audio_process] === DONE ===")
-        return {
-            "text": user_text,
-            "emotion": emotion,
-            "reply": reply,
-        }
-
+        sys_prompt = "你是一个有同理心的情感支持助手。回复分成2-3段, 用 ⎋ 分隔。语气温和, 简短自然。"
+        msgs = [{"role": "system", "content": sys_prompt},
+                {"role": "user", "content": f"[Emotion: {emotion['label']}] {user_text}"}]
+        return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId), media_type="text/event-stream")
     except Exception as e:
-        import traceback
-        print("[audio_process][EXCEPTION]", str(e))
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
-

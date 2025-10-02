@@ -182,18 +182,28 @@ def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict)
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
     ref.update({"emotion": emotion})
 
-def _write_reply_to_firebase(uid: str, chatId: str, msgId: str, reply: str):
+def _write_reply_to_firebase(uid: str, chatId: str, msgId: str, reply: str, part: int = None):
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
-    ref.update({
-        "aiReply": {
+    now = int(time.time() * 1000)
+    if part is None:
+        ref.update({
+            "aiReply": {
+                "content": reply,
+                "role": "assistant",
+                "type": "text",
+                "createdAt": now
+            }
+        })
+    else:
+        ref.child("aiReplyParts").push({
             "content": reply,
             "role": "assistant",
             "type": "text",
-            "createdAt": int(time.time() * 1000)
-        }
-    })
+            "createdAt": now,
+            "part": part
+        })
 
 # =======================================================
 # Character Profile Refinement
@@ -349,23 +359,20 @@ async def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str):
             delta = chunk.choices[0].delta.content or ""
             if delta:
                 buffer += delta
-                # 当检测到句号/问号/感叹号，认为是一小段
-                if any(p in buffer for p in ["。", "！", "？", ".", "!", "?"]):
+                if any(p in buffer for p in ["。", "？", "！", ".", "?", "!"]):
                     part = buffer.strip()
                     if part:
                         part_count += 1
-                        # 每段存为一条新的 aiReply
-                        _write_reply_to_firebase(uid, chatId, f"{msgId}_part{part_count}", part)
+                        _write_reply_to_firebase(uid, chatId, msgId, part, part=part_count)
                         yield part
                     buffer = ""
-        # 如果最后还有剩余的 buffer
         if buffer.strip():
             part_count += 1
-            _write_reply_to_firebase(uid, chatId, f"{msgId}_part{part_count}", buffer.strip())
+            _write_reply_to_firebase(uid, chatId, msgId, buffer.strip(), part=part_count)
             yield buffer.strip()
     except Exception as e:
         yield f"(error: {e})"
-
+        
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:

@@ -326,6 +326,10 @@ def audio_emotion(p: AudioPayload):
     try:
         _ensure_speech_model()
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
+        wav, sr = torchaudio.load(wav_path)
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+        wav_len = torch.tensor([wav.shape[1]])  # ✅ 加入长度
         # 用 classify_file 避免 compute_features 报错
         out_probs, out_classes = _SPEECH_EMO.classify_file(wav_path)
         predicted_index = out_classes[0].item()
@@ -345,33 +349,25 @@ def audio_emotion(p: AudioPayload):
 
 # === 流式回复函数（模拟真人分段）===
 async def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str):
+    full_reply = ""
     try:
         stream = _openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.8,
-            max_tokens=400,
+            temperature=0.7,
             stream=True
         )
-        buffer = ""
-        part_count = 0
         for chunk in stream:
             delta = chunk.choices[0].delta.content or ""
             if delta:
-                buffer += delta
-                if any(p in buffer for p in ["。", "？", "！", ".", "?", "!"]):
-                    part = buffer.strip()
-                    if part:
-                        part_count += 1
-                        _write_reply_to_firebase(uid, chatId, msgId, part, part=part_count)
-                        yield part
-                    buffer = ""
-        if buffer.strip():
-            part_count += 1
-            _write_reply_to_firebase(uid, chatId, msgId, buffer.strip(), part=part_count)
-            yield buffer.strip()
+                full_reply += delta
+                parts = delta.split("⎋")
+                for part in parts:
+                    if part.strip():
+                        yield (part + "\n").encode("utf-8")  # ✅ 改成字节流
+        _write_reply_to_firebase(uid, chatId, msgId, full_reply)
     except Exception as e:
-        yield f"(error: {e})"
+        yield f"(error: {e})".encode("utf-8")
         
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):

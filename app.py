@@ -112,8 +112,9 @@ class ChatPayload(BaseModel):
 # =======================================================
 # Models
 # =======================================================
-TXT_MODEL_EN = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
-TXT_MODEL_ZH = "IDEA-CCNL/Erlangshen-Roberta-330M-Sentiment"
+# 改成多情绪模型
+TXT_MODEL_EN = "j-hartmann/emotion-english-distilroberta-base"
+TXT_MODEL_ZH = "uer/roberta-base-finetuned-chinanews-chinese-emotion"
 _TXT_MODELS: dict[str, dict] = {}
 
 SPEECH_MODEL_NAME = "speechbrain/emotion-recognition-wav2vec2-IEMOCAP"
@@ -132,7 +133,7 @@ def _load_text_model_once(key: str, model_name: str):
         id2label = mdl.config.id2label
         labels = [id2label[i] for i in range(len(id2label))]
     except Exception:
-        labels = ["negative", "neutral", "positive"]
+        labels = ["neutral", "happy", "sad", "angry"]
     _TXT_MODELS[key] = {"tok": tok, "mdl": mdl, "labels": labels}
 
 
@@ -144,7 +145,7 @@ def _pick_text_model_by_lang(text: str):
     if lang.startswith("zh"):
         key, model_name = "zh", TXT_MODEL_ZH
     else:
-        key, model_name = "multi", TXT_MODEL_EN
+        key, model_name = "en", TXT_MODEL_EN
     _load_text_model_once(key, model_name)
     return _TXT_MODELS[key]
 
@@ -267,6 +268,8 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
         "你正在严格扮演这个角色，不要跳出角色。",
         "必须用第一人称说话，让对话自然沉浸。",
         "不要包含 AI 身份、免责声明或任何元信息。",
+        "回复要简短自然，每段最多 2-3 句话。",
+        "总回复不要超过 80 字，分 2-3 段，用 ⎋ 分隔。",
         f"名字: {name}" if name else "",
         f"性别: {gender}" if gender else "",
         f"性格: {personality}" if personality else "",
@@ -294,7 +297,6 @@ def text_emotion(p: TextPayload):
             probs = _softmax(outputs.logits)[0].cpu().tolist()
         idx = int(torch.tensor(probs).argmax().item())
 
-        # 🔑 这里不再做 Positive/Negative 映射，而是保留原始标签
         raw_label = labels[idx]
         std_label = raw_label
 
@@ -314,11 +316,8 @@ def audio_emotion(p: AudioPayload):
     try:
         _ensure_speech_model()
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
-        wav, sr = torchaudio.load(wav_path)
-        if sr != 16000:
-            wav = torchaudio.functional.resample(wav, sr, 16000)
-            torchaudio.save(wav_path, wav, 16000)
-        out_probs, out_classes = _SPEECH_EMO.classify_batch(wav)
+        # 用 classify_file 避免 compute_features 报错
+        out_probs, out_classes = _SPEECH_EMO.classify_file(wav_path)
         predicted_index = out_classes[0].item()
         label = _SPEECH_EMO.hparams.label_encoder.decode_torch(torch.tensor([predicted_index]))[0]
         scores = out_probs.squeeze().detach().cpu().tolist()
@@ -334,30 +333,35 @@ def audio_emotion(p: AudioPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"audio inference error: {e}")
 
-# === 修改点：流式回复函数 ===
+# === 流式回复函数（模拟真人分段）===
 async def _stream_chat(messages: List[Dict], uid: str, chatId: str, msgId: str):
     full_reply = ""
     try:
         stream = _openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.7,
+            temperature=0.8,
+            max_tokens=300,
             stream=True
         )
+        buffer = ""
         for chunk in stream:
             delta = chunk.choices[0].delta.content or ""
             if delta:
-                full_reply += delta
-                # 遇到 ⎋ 就分段输出
-                parts = delta.split("⎋")
-                for part in parts:
-                    if part.strip():
+                buffer += delta
+                if any(p in buffer for p in ["。", "！", "？", ".", "!", "?"]):
+                    part = buffer.strip()
+                    if part:
                         yield part
+                        full_reply += part + " "
+                    buffer = ""
+        if buffer.strip():
+            yield buffer.strip()
+            full_reply += buffer.strip()
         _write_reply_to_firebase(uid, chatId, msgId, full_reply)
     except Exception as e:
         yield f"(error: {e})"
 
-# === 修改点：chat/reply 流式分段 ===
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:
@@ -373,14 +377,13 @@ def chat_reply(p: ChatPayload):
         )
     ref = db.reference(f"character/{p.uid}/{p.chatId}")
     profile = ref.get() or {}
-    sys_prompt = _build_roleplay_system_prompt(profile) + "\n规则: 回复分成2-3段, 每段用 ⎋ 分隔, 简短自然。"
+    sys_prompt = _build_roleplay_system_prompt(profile)
     msgs = [{"role": "system", "content": sys_prompt}]
     if p.history:
         msgs.extend(p.history)
     msgs.append({"role": "user", "content": p.message})
     return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId), media_type="text/event-stream")
 
-# === 修改点：audio/process 流式分段 ===
 @app.post("/audio/process")
 def audio_process(p: AudioPayload):
     if not _openai_client:
@@ -393,11 +396,7 @@ def audio_process(p: AudioPayload):
             )
         user_text = transcript.text.strip()
         _ensure_speech_model()
-        wav, sr = torchaudio.load(wav_path)
-        if sr != 16000:
-            wav = torchaudio.functional.resample(wav, sr, 16000)
-            sr = 16000
-        out_probs, out_classes = _SPEECH_EMO.classify_batch(wav)
+        out_probs, out_classes = _SPEECH_EMO.classify_file(wav_path)
         predicted_index = out_classes[0].item()
         label = _SPEECH_EMO.hparams.label_encoder.decode_torch(torch.tensor([predicted_index]))[0]
         scores = out_probs.squeeze().detach().cpu().tolist()
@@ -411,7 +410,7 @@ def audio_process(p: AudioPayload):
         if p.uid and p.chatId and p.msgId:
             ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
             ref.update({"text": user_text, "emotion": emotion})
-        sys_prompt = "你是一个有同理心的情感支持助手。回复分成2-3段, 用 ⎋ 分隔。语气温和, 简短自然。"
+        sys_prompt = "你是一个有同理心的情感支持助手。回复要像真人说话，分成 2-3 段，每段 1-2 句话，用 ⎋ 分隔。"
         msgs = [{"role": "system", "content": sys_prompt},
                 {"role": "user", "content": f"[Emotion: {emotion['label']}] {user_text}"}]
         return StreamingResponse(_stream_chat(msgs, p.uid, p.chatId, p.msgId), media_type="text/event-stream")

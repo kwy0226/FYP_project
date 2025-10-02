@@ -124,7 +124,7 @@ class ChatPayload(BaseModel):
 # Models（细分类）
 # =======================================================
 TXT_MODEL_EN = "j-hartmann/emotion-english-distilroberta-base"         # 7类
-TXT_MODEL_ZH = "uer/roberta-base-finetuned-chinanews-chinese-emotion"  # 多类
+TXT_MODEL_ZH = "uer/roberta-base-finetuned-dianping-chinese"  # 多类
 _TXT_MODELS: dict[str, dict] = {}
 
 # 语音情绪：使用 HF 模型，取代 speechbrain

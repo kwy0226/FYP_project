@@ -5,7 +5,6 @@ python-multipart
 starlette
 torch
 transformers
-speechbrain
 torchaudio
 langdetect
 openai>=1.0.0

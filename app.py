@@ -125,15 +125,161 @@ class ChatPayload(BaseModel):
 # =======================================================
 # Models
 # =======================================================
-# 文本情绪：细粒度
+# 文本情绪：细粒度（英语）
 TXT_MODEL_EN = "SamLowe/roberta-base-go_emotions"            # 英文：28类
-# ✅ 替换掉不存在的 weibo 模型 → 使用 IDEA-CCNL/Erlangshen 中文模型
+# 中文情感（正/中/负）
 TXT_MODEL_ZH = "IDEA-CCNL/Erlangshen-Roberta-330M-Sentiment" # 中文：细粒度情绪
 _TXT_MODELS: dict[str, dict] = {}
 
 # 语音情绪模型（7类）
 AUDIO_EMO_MODEL = "superb/hubert-large-superb-er"
 _AUDIO_EMO: Dict[str, object] = {}
+
+# =======================================================
+# 四大类映射（文本 & 语音）
+# =======================================================
+GOEMO_GROUPS = {
+    "happy": {
+        "excitement", "joy", "amusement", "relief", "pride",
+        "gratitude", "love", "optimism", "desire"
+    },
+    "sad": {
+        "sadness", "disappointment", "remorse", "grief"
+    },
+    "neutral": {
+        "neutral", "approval", "curiosity", "realization",
+        "admiration", "confusion", "surprise"
+    },
+    "angry": {
+        "anger", "disgust", "disapproval", "embarrassment", "annoyance"
+    },
+}
+# 中文情感输出（正/中/负）→ 四类
+ZH_SENTIMENT_MAP = {
+    "positive": "happy",
+    "negative": "sad",   # 中文模型无法细分怒/悲，这里统一到 sad，前端仍然正常
+    "neutral": "neutral",
+}
+# 语音 7 类 → 四类
+AUDIO_GROUP_MAP = {
+    "happy": "happy",
+    "sad": "sad",
+    "neutral": "neutral",
+    "anger": "angry",
+    "angry": "angry",
+    "disgust": "angry",
+    "fear": "neutral",
+    "surprise": "neutral",
+}
+
+FOUR_KEYS = ["happy", "sad", "neutral", "angry"]
+
+
+def _empty_grouped_dict() -> Dict[str, float]:
+    return {k: 0.0 for k in FOUR_KEYS}
+
+
+def _group_goemotions(labels: List[str], probs: List[float]) -> Dict:
+    """将 GoEmotions 的细粒度标签聚合为四大类，并返回聚合后的最佳标签与分布"""
+    grouped = _empty_grouped_dict()
+    raw_idx = int(torch.tensor(probs).argmax().item())
+    raw_label = labels[raw_idx]
+    raw_conf = float(probs[raw_idx])
+
+    for i, lab in enumerate(labels):
+        p = float(probs[i])
+        found = False
+        for g, members in GOEMO_GROUPS.items():
+            if lab in members:
+                grouped[g] += p
+                found = True
+                break
+        if not found:
+            # 未涵盖的少数标签（e.g. fear, excitement 已覆盖；若仍有漏网）→ 归为 neutral
+            grouped["neutral"] += p
+
+    # 归一（不是必须，但使 confidence 更直观）
+    s = sum(grouped.values()) or 1.0
+    for k in grouped:
+        grouped[k] = grouped[k] / s
+
+    best = max(grouped.items(), key=lambda x: x[1])[0]
+    return {
+        "label": best,
+        "confidence": grouped[best],
+        "grouped_probs": grouped,
+        "raw": {
+            "label": raw_label,
+            "confidence": raw_conf,
+            "labels": labels,
+            "used_mapping": "goemotions→4"
+        }
+    }
+
+
+def _group_zh_sentiment(labels: List[str], probs: List[float]) -> Dict:
+    """
+    中文情感（正/中/负）→ 四类（angry 为 0）
+    """
+    raw_idx = int(torch.tensor(probs).argmax().item())
+    raw_label = labels[raw_idx].lower()
+    raw_conf = float(probs[raw_idx])
+
+    grouped = _empty_grouped_dict()
+    for i, lab in enumerate(labels):
+        p = float(probs[i])
+        lab = lab.lower()
+        mapped = ZH_SENTIMENT_MAP.get(lab, "neutral")
+        grouped[mapped] += p
+
+    s = sum(grouped.values()) or 1.0
+    for k in grouped:
+        grouped[k] = grouped[k] / s
+
+    best = max(grouped.items(), key=lambda x: x[1])[0]
+    return {
+        "label": best,
+        "confidence": grouped[best],
+        "grouped_probs": grouped,
+        "raw": {
+            "label": raw_label,
+            "confidence": raw_conf,
+            "labels": labels,
+            "used_mapping": "zh-sentiment→4"
+        }
+    }
+
+
+def _group_audio(labels: List[str], probs: List[float]) -> Dict:
+    """语音 7 类聚合为四类"""
+    raw_idx = int(torch.tensor(probs).argmax().item())
+    raw_label = labels[raw_idx].lower()
+    raw_conf = float(probs[raw_idx])
+
+    grouped = _empty_grouped_dict()
+    for i, lab in enumerate(labels):
+        p = float(probs[i])
+        lab = lab.lower()
+        mapped = AUDIO_GROUP_MAP.get(lab, "neutral")
+        grouped[mapped] += p
+
+    s = sum(grouped.values()) or 1.0
+    for k in grouped:
+        grouped[k] = grouped[k] / s
+
+    best = max(grouped.items(), key=lambda x: x[1])[0]
+    return {
+        "label": best,
+        "confidence": grouped[best],
+        "grouped_probs": grouped,
+        "raw": {
+            "label": raw_label,
+            "confidence": raw_conf,
+            "labels": labels,
+            "used_mapping": "audio→4"
+        }
+    }
+
 
 # =======================================================
 # Loaders
@@ -239,6 +385,7 @@ def _segment_ready(buf: str) -> bool:
     if any(p in buf for p in ["。", "！", "？", ".", "!", "?"]):
         return True
     return len(buf) >= 60  # 兜底长度
+
 # =======================================================
 # Character Profile Refinement（保留）
 # =======================================================
@@ -441,6 +588,7 @@ def _sse_stream_from_deltas(delta_iter: Iterable[str],
     except Exception:
         log.exception("sse_stream_from_deltas error")
         yield _sse({"type": "error", "message": "stream failed"})
+
 # =======================================================
 # Routes
 # =======================================================
@@ -449,7 +597,7 @@ def root():
     return {"status": "ok", "msg": "Emotion API root is alive"}
 
 
-# === 文本情绪 ===
+# === 文本情绪（统一映射到四类） ===
 @app.post("/nlp/text-emotion")
 def text_emotion(p: TextPayload):
     try:
@@ -461,14 +609,44 @@ def text_emotion(p: TextPayload):
         with torch.no_grad():
             outputs = mdl(**inputs)
             probs = _softmax(outputs.logits)[0].detach().cpu().tolist()
-        idx = int(torch.tensor(probs).argmax().item())
+
+        # 根据模型类型做聚合
+        if mdl.name_or_path.endswith("go_emotions") or len(labels) >= 10 or "joy" in [l.lower() for l in labels]:
+            grouped = _group_goemotions([l.lower() for l in labels], probs)
+        elif set([l.lower() for l in labels]) >= {"positive", "negative", "neutral"}:
+            grouped = _group_zh_sentiment([l.lower() for l in labels], probs)
+        else:
+            # 兜底：直接取 argmax 并做一个最接近的映射
+            raw_idx = int(torch.tensor(probs).argmax().item())
+            raw_label = labels[raw_idx].lower()
+            if raw_label in ("positive", "joy", "happiness", "amusement"):
+                label = "happy"
+            elif raw_label in ("negative", "sadness", "grief", "remorse", "disappointment"):
+                label = "sad"
+            elif raw_label in ("anger", "angry", "disgust", "disapproval", "annoyance"):
+                label = "angry"
+            else:
+                label = "neutral"
+            grouped = {
+                "label": label,
+                "confidence": float(probs[raw_idx]),
+                "grouped_probs": _empty_grouped_dict() | {label: 1.0},
+                "raw": {
+                    "label": raw_label,
+                    "confidence": float(probs[raw_idx]),
+                    "labels": labels,
+                    "used_mapping": "fallback"
+                }
+            }
 
         result = {
-            "label": labels[idx],
-            "confidence": float(probs[idx]),
-            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))},
+            "label": grouped["label"],
+            "confidence": float(grouped["confidence"]),
+            "grouped_probs": grouped["grouped_probs"],
+            "raw": grouped["raw"],
             "used_model": mdl.name_or_path,
         }
+
         _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
         return result
     except Exception as e:
@@ -482,13 +660,13 @@ def chat_reply(p: ChatPayload):
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
     try:
-        # 1. 文本情绪识别（细分）并写入 Firebase
+        # 1. 文本情绪识别（四类聚合）并写入 Firebase
         emo_result = None
         if p.uid and p.chatId and p.msgId:
             try:
                 emo_result = text_emotion(TextPayload(text=p.message, uid=p.uid, chatId=p.chatId, msgId=p.msgId))
                 ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
-                ref.update({"emotion": emo_result})
+                ref.update({"emotion": emo_result, "type": "text"})
             except Exception:
                 log.exception("write text emotion failed")
 
@@ -538,7 +716,7 @@ def chat_reply(p: ChatPayload):
         raise HTTPException(status_code=500, detail=f"chat_reply error: {e}")
 
 
-# === 语音：SER → GPT 回复 ===
+# === 语音：SER → GPT 回复（四类聚合） ===
 @app.post("/audio/process")
 def audio_process(p: AudioPayload):
     if not _openai_client:
@@ -565,12 +743,14 @@ def audio_process(p: AudioPayload):
         with torch.no_grad():
             logits = model(**inputs).logits
             probs = _softmax(logits)[0].detach().cpu().tolist()
-        idx = int(torch.tensor(probs).argmax().item())
+
+        grouped = _group_audio([l.lower() for l in labels], probs)
 
         emotion = {
-            "label": labels[idx],
-            "confidence": float(probs[idx]),
-            "probs": {labels[i]: float(probs[i]) for i in range(len(labels))},
+            "label": grouped["label"],
+            "confidence": float(grouped["confidence"]),
+            "grouped_probs": grouped["grouped_probs"],
+            "raw": grouped["raw"],
             "used_model": AUDIO_EMO_MODEL,
         }
 

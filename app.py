@@ -787,17 +787,38 @@ def audio_process(p: AudioPayload):
 
         headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
 
+        # ✅ 不要立即删除文件
         stream = _sse_stream_from_deltas(
-            _delta_iter_audio_with_fallback(wav_path, f"{emotion['label']} | {lang_instr}"),
-            p.uid, p.chatId, p.msgId
+            _delta_iter_audio_with_fallback(
+                wav_path,
+                f"{emotion['label']} | {lang_instr}"
+            ),
+            p.uid,
+            p.chatId,
+            p.msgId,
         )
 
-        try:
-            os.remove(wav_path)
-        except Exception:
-            pass
+        # ✅ 使用 StreamingResponse 包装，同时在最后删除文件
+        def stream_with_cleanup():
+            try:
+                for chunk in stream:
+                    yield chunk
+            finally:
+                try:
+                    if os.path.exists(wav_path):
+                        os.remove(wav_path)
+                        log.info(f"[CLEANUP] Deleted temp wav file: {wav_path}")
+                except Exception as e:
+                    log.error(f"[CLEANUP] Failed to delete wav: {e}")
 
-        return StreamingResponse(stream, media_type="text/event-stream", headers=headers)
+        return StreamingResponse(
+            stream_with_cleanup(),
+            media_type="text/event-stream",
+            headers=headers,
+        )
+
     except Exception as e:
         log.exception("audio_process error")
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
+
+

@@ -790,3 +790,8 @@ def audio_process(p: AudioPayload):
     except Exception as e:
         log.exception("audio_process error")
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)

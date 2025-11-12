@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 8080
 
 # 启动 FastAPI
-CMD uvicorn app:app --host 0.0.0.0 --port $PORT
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

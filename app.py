@@ -26,6 +26,7 @@ os.environ["HF_DATASETS_CACHE"] = "/tmp/huggingface/datasets"
 # ---------- ML deps ----------
 import torch
 import torchaudio
+torchaudio.set_audio_backend("soundfile")
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,

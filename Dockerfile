@@ -1,6 +1,5 @@
 FROM python:3.10-slim
 
-# 防止 pyc 缓存 & log 丢失
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
@@ -13,8 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 拷贝项目代码
 COPY . .
 
-# 暴露 Cloud Run 默认端口
+# Cloud Run 默认端口
 EXPOSE 8080
 
-# 启动 FastAPI
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+# ✅ 使用 shell 模式 CMD，保证 Cloud Run 的 $PORT 被正确使用
+CMD uvicorn app:app --host 0.0.0.0 --port $PORT

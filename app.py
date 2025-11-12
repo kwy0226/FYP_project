@@ -284,8 +284,8 @@ def _load_text_model_once(key: str, model_name: str):
     tok = AutoTokenizer.from_pretrained(model_name)
     mdl = AutoModelForSequenceClassification.from_pretrained(model_name)
     mdl.eval()
-    if torch.cuda.is_available():
-        mdl.to("cuda")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    mdl.to(device)
     try:
         id2label = mdl.config.id2label
         labels = [id2label[i] for i in range(len(id2label))]
@@ -314,8 +314,8 @@ def _ensure_audio_emo():
     extractor = AutoFeatureExtractor.from_pretrained(AUDIO_EMO_MODEL)
     model = AutoModelForAudioClassification.from_pretrained(AUDIO_EMO_MODEL)
     model.eval()
-    if torch.cuda.is_available():
-        model.to("cuda")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
     labels = [model.config.id2label[i] for i in range(len(model.config.id2label))]
     _AUDIO_EMO["extractor"] = extractor
     _AUDIO_EMO["model"] = model

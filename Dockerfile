@@ -1,25 +1,41 @@
 FROM python:3.10-slim
 
-# 防止 pyc 缓存 & log 丢失
+# ==============================
+# 基础环境配置
+# ==============================
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# 安装系统依赖（解决 torchaudio / torchcodec 问题）
+# ==============================
+# 安装系统依赖 (非常关键!)
+# ==============================
 RUN apt-get update && apt-get install -y \
-    libsox-dev ffmpeg git && \
-    rm -rf /var/lib/apt/lists/*
+    git \
+    ffmpeg \
+    libsox-dev \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
 
+# ==============================
 # 安装 Python 依赖
+# ==============================
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 拷贝项目代码
+# ==============================
+# 拷贝代码
+# ==============================
 COPY . .
 
-# 暴露 Cloud Run 端口
+# ==============================
+# 暴露端口（必须与 Cloud Run 一致）
+# ==============================
 EXPOSE 8080
 
-# 启动 FastAPI 应用
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+# ==============================
+# 启动 FastAPI（固定写法）
+# ==============================
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -1,19 +1,27 @@
+# ==========================================================
+# ✅ Cloud Run verified FastAPI Dockerfile
+# ==========================================================
 FROM python:3.10-slim
 
+# 避免缓存和编码问题
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# 安装依赖
+# 先复制依赖文件
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# 拷贝项目代码
+# 安装依赖（+ ffmpeg 避免 torchaudio 声音 backend 错误）
+RUN apt-get update && apt-get install -y ffmpeg && \
+    pip install --no-cache-dir -r requirements.txt && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 拷贝项目
 COPY . .
 
-# Cloud Run 默认端口
+# 暴露 Cloud Run 端口
 EXPOSE 8080
 
-# ✅ 使用 shell 模式 CMD，保证 Cloud Run 的 $PORT 被正确使用
-CMD uvicorn app:app --host 0.0.0.0 --port $PORT
+# ✅ 关键点：使用 shell 模式执行，$PORT 才能被替换
+CMD exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}

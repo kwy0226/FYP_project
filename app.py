@@ -25,10 +25,13 @@ os.environ["HF_DATASETS_CACHE"] = "/tmp/huggingface/datasets"
 
 # ---------- ML deps ----------
 import torch
-import torchaudio
+try:
+    import torchaudio
+    torchaudio._backend = None  # 防止 Cloud Run 初始化音频设备
+except Exception as e:
+    import logging
+    logging.warning(f"torchaudio init skipped: {e}")
 
-# 避免初始化崩溃：强制使用纯 Python backend
-torchaudio.set_audio_backend("soundfile")
 
 
 from transformers import (

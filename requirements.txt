@@ -5,7 +5,7 @@ python-multipart
 starlette
 torch
 transformers
-torchaudio
+torchaudio==2.1.0
 langdetect
 openai>=1.0.0
 firebase-admin

@@ -724,12 +724,17 @@ def audio_process(p: AudioPayload):
     try:
         _ensure_audio_emo()
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
-        wav, sr = torchaudio.load(wav_path)
 
-        # 单声道 & 16k
+        # ✅ 使用 soundfile 替代 torchaudio.load
+        import soundfile as sf
+        wav, sr = sf.read(wav_path, dtype="float32")  # 指定 float32，防止类型不兼容
+        wav = torch.tensor(wav).unsqueeze(0)  # 转成 tensor，方便模型处理
+
+        # ✅ 单声道 & 重采样
         if wav.shape[0] > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
         if sr != 16000:
+            import torchaudio
             wav = torchaudio.functional.resample(wav, sr, 16000)
             sr = 16000
 

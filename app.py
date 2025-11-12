@@ -25,14 +25,13 @@ os.environ["HF_DATASETS_CACHE"] = "/tmp/huggingface/datasets"
 
 # ---------- ML deps ----------
 import torch
+import logging
+
 try:
     import torchaudio
-    torchaudio._backend = None  # 防止 Cloud Run 初始化音频设备
+    torchaudio._backend = None
 except Exception as e:
-    import logging
-    logging.warning(f"torchaudio init skipped: {e}")
-
-
+    logging.warning(f"[CloudRun] torchaudio skipped: {e}")
 
 from transformers import (
     AutoTokenizer,

@@ -13,4 +13,4 @@ requests
 wikipedia-api
 soundfile
 librosa
-torchcodec==0.1.0
+

@@ -11,15 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-# =======================================================
+
 # Logging
-# =======================================================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("emotion-api")
 
-# =======================================================
-# Hugging Face 缓存目录
-# =======================================================
+# Hugging Face Cache Directory
 os.environ["TRANSFORMERS_CACHE"] = "/tmp/huggingface"
 os.environ["HF_HOME"] = "/tmp/huggingface"
 os.environ["HF_DATASETS_CACHE"] = "/tmp/huggingface/datasets"
@@ -30,8 +27,8 @@ import torchaudio
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    AutoFeatureExtractor,            # ✅ 用于音频特征
-    AutoModelForAudioClassification, # ✅ 语音情绪
+    AutoFeatureExtractor,            # For audio features
+    AutoModelForAudioClassification, # Voice Emotion
 )
 
 # language detection
@@ -47,14 +44,11 @@ from openai import OpenAI
 import firebase_admin
 from firebase_admin import credentials, db
 
-# =======================================================
 # Init
-# =======================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-# ✅ 已替换成 GPT-4o
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-# 尝试直接把音频丢给 GPT（Responses API）；失败则自动回退到转写
-ENABLE_GPT_AUDIO = os.getenv("ENABLE_GPT_AUDIO", "1")  # "1" 开启；其他值关闭
+# Attempt to feed the audio directly to GPT (Responses API); if unsuccessful, automatically fall back to transcription.
+ENABLE_GPT_AUDIO = os.getenv("ENABLE_GPT_AUDIO", "1")  # “1” enables; other values disable
 
 _openai_client = None
 if OPENAI_API_KEY:
@@ -79,9 +73,7 @@ if not firebase_admin._apps:
         except Exception as e:
             log.exception("[Firebase init error] %s", e)
 
-# =======================================================
 # FastAPI app
-# =======================================================
 app = FastAPI(title="Emotion API")
 
 app.add_middleware(
@@ -90,9 +82,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# =======================================================
 # Schemas
-# =======================================================
 class TextPayload(BaseModel):
     text: str = Field(..., min_length=1)
     uid: Optional[str] = None
@@ -122,22 +112,19 @@ class ChatPayload(BaseModel):
     msgId: Optional[str] = None
 
 
-# =======================================================
 # Models
-# =======================================================
-# 文本情绪：细粒度（英语）
-TXT_MODEL_EN = "SamLowe/roberta-base-go_emotions"            # 英文：28类
-# 中文情感（正/中/负）
-TXT_MODEL_ZH = "IDEA-CCNL/Erlangshen-Roberta-330M-Sentiment" # 中文：细粒度情绪
+# Text Sentiment: Fine-Grained (English)
+TXT_MODEL_EN = "SamLowe/roberta-base-go_emotions"            # English: Class 28
+# Chinese Emotion (Positive/Neutral/Negative)
+TXT_MODEL_ZH = "IDEA-CCNL/Erlangshen-Roberta-330M-Sentiment" # Fine-grained emotions
 _TXT_MODELS: dict[str, dict] = {}
 
-# 语音情绪模型（7类）
+# Speech Emotion Model (7 Categories)
 AUDIO_EMO_MODEL = "superb/hubert-large-superb-er"
 _AUDIO_EMO: Dict[str, object] = {}
 
-# =======================================================
-# 四大类映射（文本 & 语音）
-# =======================================================
+
+# Four Major Categories Mapping (Text & Speech)
 GOEMO_GROUPS = {
     "happy": {
         "excitement", "joy", "amusement", "relief", "pride",
@@ -154,13 +141,13 @@ GOEMO_GROUPS = {
         "anger", "disgust", "disapproval", "embarrassment", "annoyance"
     },
 }
-# 中文情感输出（正/中/负）→ 四类
+# Chinese Emotional Output (Positive/Neutral/Negative) → Four Categories
 ZH_SENTIMENT_MAP = {
     "positive": "happy",
-    "negative": "sad",   # 中文模型无法细分怒/悲，这里统一到 sad，前端仍然正常
+    "negative": "sad",   # The Chinese model cannot distinguish between anger and sadness, so both are uniformly categorized as “sad.” The frontend remains functional.
     "neutral": "neutral",
 }
-# 语音 7 类 → 四类
+# Voice Category 7 → Category 4
 AUDIO_GROUP_MAP = {
     "happy": "happy",
     "sad": "sad",
@@ -180,7 +167,7 @@ def _empty_grouped_dict() -> Dict[str, float]:
 
 
 def _group_goemotions(labels: List[str], probs: List[float]) -> Dict:
-    """将 GoEmotions 的细粒度标签聚合为四大类，并返回聚合后的最佳标签与分布"""
+    # Aggregate GoEmotions' fine-grained labels into four major categories and return the best aggregated label along with its distribution
     grouped = _empty_grouped_dict()
     raw_idx = int(torch.tensor(probs).argmax().item())
     raw_label = labels[raw_idx]
@@ -195,10 +182,10 @@ def _group_goemotions(labels: List[str], probs: List[float]) -> Dict:
                 found = True
                 break
         if not found:
-            # 未涵盖的少数标签（e.g. fear, excitement 已覆盖；若仍有漏网）→ 归为 neutral
+            # Minor tags not covered (e.g., fear, excitement are covered; if any remain overlooked) → Categorized as neutral
             grouped["neutral"] += p
 
-    # 归一（不是必须，但使 confidence 更直观）
+    # Normalization (not required, but makes confidence more intuitive)
     s = sum(grouped.values()) or 1.0
     for k in grouped:
         grouped[k] = grouped[k] / s
@@ -218,9 +205,7 @@ def _group_goemotions(labels: List[str], probs: List[float]) -> Dict:
 
 
 def _group_zh_sentiment(labels: List[str], probs: List[float]) -> Dict:
-    """
-    中文情感（正/中/负）→ 四类（angry 为 0）
-    """
+    # Chinese Sentiment (Positive/Neutral/Negative) → Four Categories (angry = 0)
     raw_idx = int(torch.tensor(probs).argmax().item())
     raw_label = labels[raw_idx].lower()
     raw_conf = float(probs[raw_idx])
@@ -251,7 +236,7 @@ def _group_zh_sentiment(labels: List[str], probs: List[float]) -> Dict:
 
 
 def _group_audio(labels: List[str], probs: List[float]) -> Dict:
-    """语音 7 类聚合为四类"""
+    # Voice Category 7 Aggregated into Four Categories
     raw_idx = int(torch.tensor(probs).argmax().item())
     raw_label = labels[raw_idx].lower()
     raw_conf = float(probs[raw_idx])
@@ -281,9 +266,7 @@ def _group_audio(labels: List[str], probs: List[float]) -> Dict:
     }
 
 
-# =======================================================
 # Loaders
-# =======================================================
 def _load_text_model_once(key: str, model_name: str):
     if key in _TXT_MODELS:
         return
@@ -328,9 +311,7 @@ def _ensure_audio_emo():
     _AUDIO_EMO["labels"] = labels
     log.info("[AUDIO] loaded %s", AUDIO_EMO_MODEL)
 
-# =======================================================
 # Helpers
-# =======================================================
 def _softmax(logits: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.softmax(logits, dim=-1)
 
@@ -384,11 +365,9 @@ def _sse(data_obj: Dict) -> bytes:
 def _segment_ready(buf: str) -> bool:
     if any(p in buf for p in ["。", "！", "？", ".", "!", "?"]):
         return True
-    return len(buf) >= 60  # 兜底长度
+    return len(buf) >= 60  # Hem Length
 
-# =======================================================
-# Character Profile Refinement（保留）
-# =======================================================
+# Character Profile Refinement
 def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
     user_agent = "EmotionMate/1.0"
     wiki_zh = wikipediaapi.Wikipedia(user_agent=user_agent, language="zh")
@@ -401,9 +380,9 @@ def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
         if page.exists():
             summary = page.summary[0:800]
             resp = _openai_client.chat.completions.create(
-                model="gpt-4o",   # ✅ 改为 gpt-4o
+                model="gpt-4o",   
                 messages=[
-                    {"role": "system", "content": "你是一个翻译助手，把输入的英文简介翻译成中文，保持简洁自然。"},
+                    {"role": "system", "content": "You are a translation assistant tasked with converting the provided English introduction into Chinese while maintaining conciseness and naturalness."},
                     {"role": "user", "content": summary}
                 ]
             )
@@ -413,13 +392,13 @@ def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
 
     full_bg = ai_background
     if summary:
-        full_bg += "\n\n[补全资料] " + summary
+        full_bg += "\n\n[Filling in the information] " + summary
 
     resp2 = _openai_client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "你是一个角色分析专家。"},
-            {"role": "user", "content": f"以下是角色 {ai_name} 的背景资料：\n{full_bg}\n\n请帮我总结：\n1. 角色的性格特点。\n2. 精炼一个适合 Roleplay 的背景描述。\n3. 让角色的说话方式更接近真人。"}
+            {"role": "system", "content": "You are an expert in character analysis."},
+            {"role": "user", "content": f"Below are the characters {ai_name} Background information:\n{full_bg}\n\nPlease summarize for me:\n1. Character traits.\n2. Refine a background description suitable for roleplay.\n3. Make the characters' speech patterns sound more like real people."}
         ]
     )
     result_text = resp2.choices[0].message.content.strip()
@@ -458,24 +437,22 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
     personality = (profile.get("aiPersonality") or "").strip()
     background = (profile.get("aiBackground") or "").strip()
     lines = [
-        "你正在严格扮演这个角色，不要跳出角色。",
-        "必须用第一人称说话，让对话自然沉浸。",
-        "避免AI身份、免责声明或元信息。",
-        "每次回复≤80字，分2–3段，每段1–2句，像真人语气。",
-        "语气可以带情绪波动，像真人聊天。"
+        "You are strictly playing this role; do not break character.",
+        "Speak in the first person to make the dialogue feel natural and immersive.",
+        "Avoid AI identity, disclaimers, or metadata.",
+        "Each reply should be ≤50 characters, divided into 2–3 paragraphs, with 1–2 sentences per paragraph, sounding like a real person.",
+        "The tone should convey emotional fluctuations, as if a real person were chatting."
     ]
-    if name: lines.append(f"名字: {name}")
-    if gender: lines.append(f"性别: {gender}")
-    if personality: lines.append(f"性格: {personality}")
-    if background: lines.append(f"背景: {background}")
+    if name: lines.append(f"aiName: {name}")
+    if gender: lines.append(f"aiGender: {gender}")
+    if personality: lines.append(f"aiPersonality: {personality}")
+    if background: lines.append(f"aiBackground: {background}")
     return "\n".join(lines)
 
 
-# =======================================================
-# OpenAI 统一增量文本迭代器 + SSE 包装
-# =======================================================
+# OpenAI Unified Incremental Text Iterator + SSE Wrapper
 def _delta_iter_chat(messages: List[Dict]) -> Iterable[str]:
-    """chat.completions 流，产出文本增量"""
+    # chat.completions stream, producing incremental text
     stream = _openai_client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
@@ -493,10 +470,8 @@ def _delta_iter_chat(messages: List[Dict]) -> Iterable[str]:
 
 
 def _delta_iter_audio_with_fallback(wav_path: str, emotion_label: str) -> Iterable[str]:
-    """
-    优先使用 Responses API 直接理解音频；
-    不可用则自动回退到 Whisper 转写 + 文本对话。
-    """
+    # Prioritize using the Responses API to directly understand audio;
+    # If unavailable, automatically fall back to Whisper transcription + text-based conversation.
     if ENABLE_GPT_AUDIO == "1":
         try:
             with open(wav_path, "rb") as f:
@@ -509,7 +484,7 @@ def _delta_iter_audio_with_fallback(wav_path: str, emotion_label: str) -> Iterab
                         "role": "user",
                         "content": [
                             {"type": "input_text",
-                             "text": f"收到一段语音。用户当前情绪：{emotion_label}。请用同理心、口语化、简短的方式回复。分2–3段，每段1–2句，总字数≤80。"},
+                             "text": f"Received a voice message. User's current mood:{emotion_label}。Please respond with empathy and in a conversational, human-like tone based on the user's content and emotional tone. Divide into 2–3 paragraphs, with 1–2 sentences per paragraph, totaling ≤50 words."},
                             {"type": "input_audio",
                              "audio": {"data": b64, "format": "wav"}}
                         ],
@@ -531,19 +506,19 @@ def _delta_iter_audio_with_fallback(wav_path: str, emotion_label: str) -> Iterab
         except Exception:
             log.exception("Responses API audio path failed, fallback to transcription")
 
-    # 回退 → Whisper 转写
+    # Rollback → Whisper Transcription
     try:
         with open(wav_path, "rb") as f:
             transcript = _openai_client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe", file=f
             )
-        user_text = (transcript.text or "").strip() or "（语音内容未能识别）"
+        user_text = (transcript.text or "").strip() or "（Voice content could not be recognized.）"
     except Exception:
         log.exception("Transcription failed, use placeholder text")
-        user_text = "（语音内容无法转写）"
+        user_text = "（Voice content cannot be transcribed.）"
 
     messages = [
-        {"role": "system", "content": "你是一个有同理心的情感支持助手。像真人一样说话：分成 2–3 段，每段 1–2 句，总字数≤80。"},
+        {"role": "system", "content": "You are an empathetic emotional support assistant. Speak like a real person: Break into 2–3 paragraphs, each containing 1–2 sentences, with a total word count ≤50."},
         {"role": "user", "content": f"[Emotion: {emotion_label}] {user_text}"}
     ]
     yield from _delta_iter_chat(messages)
@@ -551,7 +526,7 @@ def _delta_iter_audio_with_fallback(wav_path: str, emotion_label: str) -> Iterab
 
 def _sse_stream_from_deltas(delta_iter: Iterable[str],
                             uid: str, chatId: str, msgId: str) -> Iterator[bytes]:
-    """把任意增量文本转换成 SSE + Firebase 分段 & 全文写入"""
+    # Convert any incremental text into SSE + Firebase segmented & full-text writes
     full_reply: List[str] = []
     buf = ""
     part_idx = 0
@@ -589,15 +564,13 @@ def _sse_stream_from_deltas(delta_iter: Iterable[str],
         log.exception("sse_stream_from_deltas error")
         yield _sse({"type": "error", "message": "stream failed"})
 
-# =======================================================
 # Routes
-# =======================================================
 @app.get("/")
 def root():
     return {"status": "ok", "msg": "Emotion API root is alive"}
 
 
-# === 文本情绪（统一映射到四类） ===
+# Text Sentiment (Unified Mapping to Four Categories)
 @app.post("/nlp/text-emotion")
 def text_emotion(p: TextPayload):
     try:
@@ -610,13 +583,13 @@ def text_emotion(p: TextPayload):
             outputs = mdl(**inputs)
             probs = _softmax(outputs.logits)[0].detach().cpu().tolist()
 
-        # 根据模型类型做聚合
+        # Aggregate by model type
         if mdl.name_or_path.endswith("go_emotions") or len(labels) >= 10 or "joy" in [l.lower() for l in labels]:
             grouped = _group_goemotions([l.lower() for l in labels], probs)
         elif set([l.lower() for l in labels]) >= {"positive", "negative", "neutral"}:
             grouped = _group_zh_sentiment([l.lower() for l in labels], probs)
         else:
-            # 兜底：直接取 argmax 并做一个最接近的映射
+            # Fallback: Directly take the argmax and perform a closest-match mapping.
             raw_idx = int(torch.tensor(probs).argmax().item())
             raw_label = labels[raw_idx].lower()
             if raw_label in ("positive", "joy", "happiness", "amusement"):
@@ -654,13 +627,13 @@ def text_emotion(p: TextPayload):
         raise HTTPException(status_code=500, detail=f"text inference error: {e}")
 
 
-# === Chat SSE（文字消息）===
+# Chat SSE (Text Messages)
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
     try:
-        # 1. 文本情绪识别（四类聚合）并写入 Firebase
+        # 1. Text Sentiment Analysis (Four-Category Aggregation) and Writing to Firebase
         emo_result = None
         if p.uid and p.chatId and p.msgId:
             try:
@@ -670,7 +643,7 @@ def chat_reply(p: ChatPayload):
             except Exception:
                 log.exception("write text emotion failed")
 
-        # 2. 更新角色资料
+        # 2. Update Character Profile
         if p.uid and p.aiName:
             try:
                 _upsert_user_character_profile(
@@ -680,7 +653,7 @@ def chat_reply(p: ChatPayload):
             except Exception:
                 log.exception("upsert character profile failed")
 
-        # 3. 获取角色资料
+        # 3. Retrieve Character Data
         try:
             ref = db.reference(f"character/{p.uid}/{p.chatId}")
             profile = ref.get() or {}
@@ -690,7 +663,7 @@ def chat_reply(p: ChatPayload):
 
         sys_prompt = _build_roleplay_system_prompt(profile)
 
-        # 4. 自动检测语言 → 控制 GPT 回复语言
+        # 4. Auto-detect language → Control GPT response language
         try:
             lang = detect(p.message)
         except Exception:
@@ -716,7 +689,7 @@ def chat_reply(p: ChatPayload):
         raise HTTPException(status_code=500, detail=f"chat_reply error: {e}")
 
 
-# === 语音：SER → GPT 回复（四类聚合） ===
+# Voice: SER → GPT Response (Four-Category Aggregation) 
 @app.post("/audio/process")
 def audio_process(p: AudioPayload):
     if not _openai_client:
@@ -725,12 +698,12 @@ def audio_process(p: AudioPayload):
         _ensure_audio_emo()
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
 
-        # ✅ 使用 soundfile 替代 torchaudio.load
+        # Use `soundfile` instead of `torchaudio.load`
         import soundfile as sf
-        wav, sr = sf.read(wav_path, dtype="float32")  # 指定 float32，防止类型不兼容
-        wav = torch.tensor(wav).unsqueeze(0)  # 转成 tensor，方便模型处理
+        wav, sr = sf.read(wav_path, dtype="float32")  # Specify float32 to prevent type incompatibility
+        wav = torch.tensor(wav).unsqueeze(0)  # Convert to tensor for easier model processing
 
-        # ✅ 单声道 & 重采样
+        # Mono & Resampling
         if wav.shape[0] > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
         if sr != 16000:
@@ -738,7 +711,7 @@ def audio_process(p: AudioPayload):
             wav = torchaudio.functional.resample(wav, sr, 16000)
             sr = 16000
 
-        # 1. SER 检测语音情绪
+        # 1. SER Voice Emotion Detection
         extractor = _AUDIO_EMO["extractor"]
         model: AutoModelForAudioClassification = _AUDIO_EMO["model"]
         labels: List[str] = _AUDIO_EMO["labels"]
@@ -759,7 +732,7 @@ def audio_process(p: AudioPayload):
             "used_model": AUDIO_EMO_MODEL,
         }
 
-        # 2. 写入 Firebase
+        # 2. Write to Firebase
         if p.uid and p.chatId and p.msgId:
             try:
                 ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
@@ -767,10 +740,10 @@ def audio_process(p: AudioPayload):
             except Exception:
                 log.exception("write audio emotion failed")
 
-        # 3. 自动语言检测 → 控制回复语言
+        # 3. Automatic Language Detection → Control Response Language
         user_lang = "en"
         try:
-            # 尝试先转写判断语言
+            # Attempt to transcribe and determine the language first
             with open(wav_path, "rb") as f:
                 transcript = _openai_client.audio.transcriptions.create(
                     model="gpt-4o-mini-transcribe", file=f
@@ -787,7 +760,7 @@ def audio_process(p: AudioPayload):
 
         headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
 
-        # ✅ 不要立即删除文件
+        # Do not delete the file immediately
         stream = _sse_stream_from_deltas(
             _delta_iter_audio_with_fallback(
                 wav_path,
@@ -798,7 +771,7 @@ def audio_process(p: AudioPayload):
             p.msgId,
         )
 
-        # ✅ 使用 StreamingResponse 包装，同时在最后删除文件
+        # Wrap using StreamingResponse and delete the file afterward
         def stream_with_cleanup():
             try:
                 for chunk in stream:

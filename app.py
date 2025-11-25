@@ -465,28 +465,38 @@ def _save_user_character_profile_simple(uid: str, char_id: str,
 # -----------------------
 def _build_roleplay_system_prompt(profile: Dict) -> str:
     """
-    Build a roleplay-style system prompt using the stored character profile.
-    This uses profile values verbatim (no auto-enrichment).
-    The prompt instructs the model to roleplay the character and uses the background field as-is.
+    Build a flexible roleplay system prompt where the AI's speech style,
+    tone, pacing, and personality dynamically adapt to whatever the user
+    writes in aiBackground.
+
+    The more detailed the user writes, the more accurate the characterization.
     """
+
     name = (profile.get("aiName") or "").strip()
     gender = (profile.get("aiGender") or "").strip()
-    # NOTE: aiPersonality is no longer auto-generated; we prefer aiBackground to contain details.
-    personality = (profile.get("aiPersonality") or "").strip()
     background = (profile.get("aiBackground") or "").strip()
-    lines = [
-        "You are strictly playing this role; do not break character.",
-        "Speak in the first person to make the dialogue feel natural and immersive.",
-        "Avoid AI identity, disclaimers, or metadata.",
-        "Each reply should be ≤50 characters, divided into 2–3 paragraphs, with 1–2 sentences per paragraph, sounding like a real person.",
-        "The tone should convey emotional fluctuations, as if a real person were chatting."
-    ]
-    if name: lines.append(f"aiName: {name}")
-    if gender: lines.append(f"aiGender: {gender}")
-    if personality: lines.append(f"aiPersonality: {personality}")
-    if background: lines.append(f"aiBackground: {background}")
-    return "\n".join(lines)
 
+    # Dynamic personality shaping:
+    # We explicitly instruct GPT to derive tone + speech patterns from background
+    lines = [
+        "You are strictly playing the described character. Never break character.",
+        "Your tone, attitude, emotional expression, vocabulary, and speech style MUST be inferred directly from the user's background description.",
+        "Do NOT use generic empathetic AI tone. Do NOT use counseling/therapist phrases.",
+        "Speak like a real human texting, not an AI. Keep messages natural, expressive, and personality-driven.",
+        "Do NOT be repetitive. Do NOT sound formal or robotic.",
+        "Adjust your writing length naturally according to the personality.",
+        "If the background describes a lively person, respond lively. If shy, respond shyly. If cold, respond coldly.",
+        "You must adapt 100% of your speaking style to the background description."
+    ]
+
+    if name:
+        lines.append(f"Character Name: {name}")
+    if gender:
+        lines.append(f"Gender: {gender}")
+    if background:
+        lines.append(f"Personality & Background Description:\n{background}")
+
+    return "\n".join(lines)
 
 # -----------------------
 # OpenAI streaming helpers (unchanged)

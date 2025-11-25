@@ -11,12 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-
-# Logging
+# -----------------------
+# Basic logging + env
+# -----------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("emotion-api")
 
-# Hugging Face Cache Directory
+# Temporary huggingface caches (if models are used)
 os.environ["TRANSFORMERS_CACHE"] = "/tmp/huggingface"
 os.environ["HF_HOME"] = "/tmp/huggingface"
 os.environ["HF_DATASETS_CACHE"] = "/tmp/huggingface/datasets"
@@ -31,11 +32,8 @@ from transformers import (
     AutoModelForAudioClassification, # Voice Emotion
 )
 
-# language detection
+# language detection for controlling response language
 from langdetect import detect
-
-# wikipedia
-import wikipediaapi
 
 # ---------- OpenAI ----------
 from openai import OpenAI
@@ -44,11 +42,12 @@ from openai import OpenAI
 import firebase_admin
 from firebase_admin import credentials, db
 
-# Init
+# -----------------------
+# OpenAI and Firebase init
+# -----------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-# Attempt to feed the audio directly to GPT (Responses API); if unsuccessful, automatically fall back to transcription.
-ENABLE_GPT_AUDIO = os.getenv("ENABLE_GPT_AUDIO", "1")  # “1” enables; other values disable
+ENABLE_GPT_AUDIO = os.getenv("ENABLE_GPT_AUDIO", "1")  # Keep responses API audio path enabled by default
 
 _openai_client = None
 if OPENAI_API_KEY:
@@ -58,7 +57,7 @@ if OPENAI_API_KEY:
     except Exception as e:
         log.exception("[OpenAI init error] %s", e)
 
-# Firebase init
+# Firebase init using credentials JSON in env (as before)
 if not firebase_admin._apps:
     cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
     if cred_json:
@@ -74,7 +73,7 @@ if not firebase_admin._apps:
             log.exception("[Firebase init error] %s", e)
 
 # FastAPI app
-app = FastAPI(title="Emotion API")
+app = FastAPI(title="Emotion API (no-autofill)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,7 +81,9 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# Schemas
+# -----------------------
+# Request schemas
+# -----------------------
 class TextPayload(BaseModel):
     text: str = Field(..., min_length=1)
     uid: Optional[str] = None
@@ -102,29 +103,29 @@ class ChatPayload(BaseModel):
     emotion: Optional[Dict] = None
     history: Optional[List[Dict]] = None
 
+    # IMPORTANT: These are accepted from client and saved as-is.
     aiName: Optional[str] = None
     aiGender: Optional[str] = None
     aiBackground: Optional[str] = None
-    aiPersonality: Optional[str] = None
 
     uid: Optional[str] = None
     chatId: Optional[str] = None
     msgId: Optional[str] = None
 
 
-# Models
-# Text Sentiment: Fine-Grained (English)
-TXT_MODEL_EN = "SamLowe/roberta-base-go_emotions"            # English: Class 28
-# Chinese Emotion (Positive/Neutral/Negative)
-TXT_MODEL_ZH = "IDEA-CCNL/Erlangshen-Roberta-330M-Sentiment" # Fine-grained emotions
+# -----------------------
+# Models / mapping config
+# -----------------------
+# Text Sentiment models (you already used)
+TXT_MODEL_EN = "SamLowe/roberta-base-go_emotions"
+TXT_MODEL_ZH = "IDEA-CCNL/Erlangshen-Roberta-330M-Sentiment"
 _TXT_MODELS: dict[str, dict] = {}
 
-# Speech Emotion Model (7 Categories)
+# Voice emotion model
 AUDIO_EMO_MODEL = "superb/hubert-large-superb-er"
 _AUDIO_EMO: Dict[str, object] = {}
 
-
-# Four Major Categories Mapping (Text & Speech)
+# Mapping of GoEmotions -> 4 categories
 GOEMO_GROUPS = {
     "happy": {
         "excitement", "joy", "amusement", "relief", "pride",
@@ -141,13 +142,11 @@ GOEMO_GROUPS = {
         "anger", "disgust", "disapproval", "embarrassment", "annoyance"
     },
 }
-# Chinese Emotional Output (Positive/Neutral/Negative) → Four Categories
 ZH_SENTIMENT_MAP = {
     "positive": "happy",
-    "negative": "sad",   # The Chinese model cannot distinguish between anger and sadness, so both are uniformly categorized as “sad.” The frontend remains functional.
+    "negative": "sad",
     "neutral": "neutral",
 }
-# Voice Category 7 → Category 4
 AUDIO_GROUP_MAP = {
     "happy": "happy",
     "sad": "sad",
@@ -158,7 +157,6 @@ AUDIO_GROUP_MAP = {
     "fear": "neutral",
     "surprise": "neutral",
 }
-
 FOUR_KEYS = ["happy", "sad", "neutral", "angry"]
 
 
@@ -167,12 +165,17 @@ def _empty_grouped_dict() -> Dict[str, float]:
 
 
 def _group_goemotions(labels: List[str], probs: List[float]) -> Dict:
-    # Aggregate GoEmotions' fine-grained labels into four major categories and return the best aggregated label along with its distribution
+    """
+    Aggregate fine-grained GoEmotions labels into four broad categories,
+    then return a dict containing label, confidence, grouped_probs and raw info.
+    """
     grouped = _empty_grouped_dict()
+    # raw label/confidence from argmax of original probs
     raw_idx = int(torch.tensor(probs).argmax().item())
     raw_label = labels[raw_idx]
     raw_conf = float(probs[raw_idx])
 
+    # Aggregate probabilities into our four buckets
     for i, lab in enumerate(labels):
         p = float(probs[i])
         found = False
@@ -182,10 +185,9 @@ def _group_goemotions(labels: List[str], probs: List[float]) -> Dict:
                 found = True
                 break
         if not found:
-            # Minor tags not covered (e.g., fear, excitement are covered; if any remain overlooked) → Categorized as neutral
             grouped["neutral"] += p
 
-    # Normalization (not required, but makes confidence more intuitive)
+    # Normalize
     s = sum(grouped.values()) or 1.0
     for k in grouped:
         grouped[k] = grouped[k] / s
@@ -205,7 +207,10 @@ def _group_goemotions(labels: List[str], probs: List[float]) -> Dict:
 
 
 def _group_zh_sentiment(labels: List[str], probs: List[float]) -> Dict:
-    # Chinese Sentiment (Positive/Neutral/Negative) → Four Categories (angry = 0)
+    """
+    Chinese sentiment mapping (positive/neutral/negative) -> four categories.
+    Note: the Chinese model cannot reliably separate anger vs sadness; we map negative->sad.
+    """
     raw_idx = int(torch.tensor(probs).argmax().item())
     raw_label = labels[raw_idx].lower()
     raw_conf = float(probs[raw_idx])
@@ -236,7 +241,9 @@ def _group_zh_sentiment(labels: List[str], probs: List[float]) -> Dict:
 
 
 def _group_audio(labels: List[str], probs: List[float]) -> Dict:
-    # Voice Category 7 Aggregated into Four Categories
+    """
+    Aggregate audio model outputs (7 categories) into our 4 categories.
+    """
     raw_idx = int(torch.tensor(probs).argmax().item())
     raw_label = labels[raw_idx].lower()
     raw_conf = float(probs[raw_idx])
@@ -266,8 +273,14 @@ def _group_audio(labels: List[str], probs: List[float]) -> Dict:
     }
 
 
-# Loaders
+# -----------------------
+# Model loaders (lazy)
+# -----------------------
 def _load_text_model_once(key: str, model_name: str):
+    """
+    Load a text model/tokenizer once and cache it in _TXT_MODELS.
+    This function moves model to GPU if available.
+    """
     if key in _TXT_MODELS:
         return
     tok = AutoTokenizer.from_pretrained(model_name)
@@ -285,6 +298,9 @@ def _load_text_model_once(key: str, model_name: str):
 
 
 def _pick_text_model_by_lang(text: str):
+    """
+    Choose text model by language detection — default to English if detection fails.
+    """
     try:
         lang = detect(text)
     except Exception:
@@ -298,6 +314,9 @@ def _pick_text_model_by_lang(text: str):
 
 
 def _ensure_audio_emo():
+    """
+    Load audio emotion model/extractor once and cache.
+    """
     if _AUDIO_EMO:
         return
     extractor = AutoFeatureExtractor.from_pretrained(AUDIO_EMO_MODEL)
@@ -311,29 +330,49 @@ def _ensure_audio_emo():
     _AUDIO_EMO["labels"] = labels
     log.info("[AUDIO] loaded %s", AUDIO_EMO_MODEL)
 
-# Helpers
+
+# -----------------------
+# Utility helpers
+# -----------------------
 def _softmax(logits: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.softmax(logits, dim=-1)
 
+
 def _strip_data_url_prefix(b64: str) -> str:
+    """
+    If the base64 string includes a data URL prefix, strip it.
+    """
     if "," in b64 and "base64" in b64[:64]:
         return b64.split(",", 1)[1]
     return b64
 
+
 def _base64_wav_to_tmpfile(b64: str) -> str:
+    """
+    Convert base64 wav -> temporary file path and return path.
+    """
     raw = base64.b64decode(_strip_data_url_prefix(b64), validate=True)
     path = f"/tmp/audio_{int(time.time() * 1000)}.wav"
     with open(path, "wb") as f:
         f.write(raw)
     return path
 
+
 def _write_emotion_to_firebase(uid: str, chatId: str, msgId: str, emotion: Dict):
+    """
+    Write the computed emotion object into the corresponding message node in Firebase.
+    If any of uid/chatId/msgId is missing the function returns early.
+    """
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
     ref.update({"emotion": emotion})
 
+
 def _push_reply_part(uid: str, chatId: str, msgId: str, content: str, part_idx: int):
+    """
+    Append an incremental 'aiReplyParts' chunk into Firebase for streaming UI.
+    """
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}").child("aiReplyParts")
@@ -346,7 +385,11 @@ def _push_reply_part(uid: str, chatId: str, msgId: str, content: str, part_idx: 
         "part": part_idx
     })
 
+
 def _write_full_reply(uid: str, chatId: str, msgId: str, reply: str):
+    """
+    Write the final assembled assistant reply (aiReply) into Firebase.
+    """
     if not uid or not chatId or not msgId:
         return
     ref = db.reference(f"chathistory/{uid}/{chatId}/messages/{msgId}")
@@ -359,81 +402,76 @@ def _write_full_reply(uid: str, chatId: str, msgId: str, reply: str):
         }
     })
 
+
 def _sse(data_obj: Dict) -> bytes:
+    """
+    Convert a JSON-able object into Server-Sent Event bytes with 'data:' prefix.
+    """
     return f"data: {json.dumps(data_obj, ensure_ascii=False)}\n\n".encode("utf-8")
 
+
 def _segment_ready(buf: str) -> bool:
+    """
+    Decide whether a text buffer is ready to flush as a chunk.
+    Heuristics: punctuation or length threshold.
+    """
     if any(p in buf for p in ["。", "！", "？", ".", "!", "?"]):
         return True
-    return len(buf) >= 60  # Hem Length
-
-# Character Profile Refinement
-def _refine_character_profile(ai_name: str, ai_background: str) -> Dict:
-    user_agent = "EmotionMate/1.0"
-    wiki_zh = wikipediaapi.Wikipedia(user_agent=user_agent, language="zh")
-    wiki_en = wikipediaapi.Wikipedia(user_agent=user_agent, language="en")
-
-    page = wiki_zh.page(ai_name.strip())
-    summary = ""
-    if not page.exists():
-        page = wiki_en.page(ai_name.strip())
-        if page.exists():
-            summary = page.summary[0:800]
-            resp = _openai_client.chat.completions.create(
-                model="gpt-4o",   
-                messages=[
-                    {"role": "system", "content": "You are a translation assistant tasked with converting the provided English introduction into Chinese while maintaining conciseness and naturalness."},
-                    {"role": "user", "content": summary}
-                ]
-            )
-            summary = resp.choices[0].message.content.strip()
-    else:
-        summary = page.summary[0:800]
-
-    full_bg = ai_background
-    if summary:
-        full_bg += "\n\n[Filling in the information] " + summary
-
-    resp2 = _openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "You are an expert in character analysis."},
-            {"role": "user", "content": f"Below are the characters {ai_name} Background information:\n{full_bg}\n\nPlease summarize for me:\n1. Character traits.\n2. Refine a background description suitable for roleplay.\n3. Make the characters' speech patterns sound more like real people."}
-        ]
-    )
-    result_text = resp2.choices[0].message.content.strip()
-
-    return {
-        "aiBackground": full_bg,
-        "aiPersonality": result_text
-    }
+    return len(buf) >= 60
 
 
-def _upsert_user_character_profile(uid: str, char_id: str, ai_name: Optional[str],
-                                   ai_gender: Optional[str], ai_background: Optional[str]):
-    if not uid or not char_id or not ai_name:
+# -----------------------
+# Character profile storage (SIMPLE)
+# -----------------------
+def _save_user_character_profile_simple(uid: str, char_id: str,
+                                       ai_name: Optional[str], ai_gender: Optional[str],
+                                       ai_background: Optional[str]):
+    """
+    Save character settings exactly as supplied by the client into Firebase.
+    This function DOES NOT perform any enrichment, web lookup or auto-generation.
+    It simply updates the character node and returns.
+    """
+    if not uid or not char_id:
         return
     now_ts = int(time.time() * 1000)
     ref = db.reference(f"character/{uid}/{char_id}")
     snap = ref.get() or {}
-    enriched = {}
-    if ai_background:
-        enriched = _refine_character_profile(ai_name, ai_background)
+
     updates = {
         "aiName": ai_name or snap.get("aiName", ""),
         "aiGender": ai_gender or snap.get("aiGender", ""),
-        "aiBackground": enriched.get("aiBackground", ai_background or snap.get("aiBackground", "")),
-        "aiPersonality": enriched.get("aiPersonality", snap.get("aiPersonality", "")),
+        "aiBackground": ai_background if ai_background is not None else snap.get("aiBackground", ""),
+        # do NOT create aiPersonality on server side
         "updatedAt": now_ts,
     }
     if not snap:
         updates["createdAt"] = now_ts
     ref.update(updates)
 
+    # Also synchronize key metadata that the frontend expects (chat list / homepage)
+    # Meta lives under chathistory/<uid>/<char_id>/meta
+    meta_ref = db.reference(f"chathistory/{uid}/{char_id}/meta")
+    try:
+        meta_ref.update({
+            "aiName": updates["aiName"],
+            "updatedAt": now_ts,
+        })
+    except Exception:
+        log.exception("meta sync failed in save_user_character_profile_simple")
 
+
+# -----------------------
+# Roleplay system prompt builder
+# -----------------------
 def _build_roleplay_system_prompt(profile: Dict) -> str:
+    """
+    Build a roleplay-style system prompt using the stored character profile.
+    This uses profile values verbatim (no auto-enrichment).
+    The prompt instructs the model to roleplay the character and uses the background field as-is.
+    """
     name = (profile.get("aiName") or "").strip()
     gender = (profile.get("aiGender") or "").strip()
+    # NOTE: aiPersonality is no longer auto-generated; we prefer aiBackground to contain details.
     personality = (profile.get("aiPersonality") or "").strip()
     background = (profile.get("aiBackground") or "").strip()
     lines = [
@@ -450,9 +488,13 @@ def _build_roleplay_system_prompt(profile: Dict) -> str:
     return "\n".join(lines)
 
 
-# OpenAI Unified Incremental Text Iterator + SSE Wrapper
+# -----------------------
+# OpenAI streaming helpers (unchanged)
+# -----------------------
 def _delta_iter_chat(messages: List[Dict]) -> Iterable[str]:
-    # chat.completions stream, producing incremental text
+    """
+    Create an OpenAI chat completion stream and yield incremental content deltas.
+    """
     stream = _openai_client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
@@ -470,8 +512,11 @@ def _delta_iter_chat(messages: List[Dict]) -> Iterable[str]:
 
 
 def _delta_iter_audio_with_fallback(wav_path: str, emotion_label: str) -> Iterable[str]:
-    # Prioritize using the Responses API to directly understand audio;
-    # If unavailable, automatically fall back to Whisper transcription + text-based conversation.
+    """
+    Try to use the Responses API to directly process audio. If not available or fails,
+    fallback to transcription + text-based chat streaming.
+    """
+    # Attempt direct audio path via Responses API if enabled
     if ENABLE_GPT_AUDIO == "1":
         try:
             with open(wav_path, "rb") as f:
@@ -506,7 +551,7 @@ def _delta_iter_audio_with_fallback(wav_path: str, emotion_label: str) -> Iterab
         except Exception:
             log.exception("Responses API audio path failed, fallback to transcription")
 
-    # Rollback → Whisper Transcription
+    # Fallback to whisper transcription + text-based chat
     try:
         with open(wav_path, "rb") as f:
             transcript = _openai_client.audio.transcriptions.create(
@@ -526,7 +571,10 @@ def _delta_iter_audio_with_fallback(wav_path: str, emotion_label: str) -> Iterab
 
 def _sse_stream_from_deltas(delta_iter: Iterable[str],
                             uid: str, chatId: str, msgId: str) -> Iterator[bytes]:
-    # Convert any incremental text into SSE + Firebase segmented & full-text writes
+    """
+    Convert an iterator of delta strings into SSE frames while also writing
+    incremental parts and the final assembled reply into Firebase.
+    """
     full_reply: List[str] = []
     buf = ""
     part_idx = 0
@@ -564,13 +612,16 @@ def _sse_stream_from_deltas(delta_iter: Iterable[str],
         log.exception("sse_stream_from_deltas error")
         yield _sse({"type": "error", "message": "stream failed"})
 
-# Routes
+
+# -----------------------
+# HTTP Routes
+# -----------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "msg": "Emotion API root is alive"}
+    return {"status": "ok", "msg": "Emotion API root is alive (no auto-fill)"}
 
 
-# Text Sentiment (Unified Mapping to Four Categories)
+# Text emotion route — unchanged behaviour, maps model outputs to 4 categories
 @app.post("/nlp/text-emotion")
 def text_emotion(p: TextPayload):
     try:
@@ -583,13 +634,12 @@ def text_emotion(p: TextPayload):
             outputs = mdl(**inputs)
             probs = _softmax(outputs.logits)[0].detach().cpu().tolist()
 
-        # Aggregate by model type
+        # Decide mapping based on model labels
         if mdl.name_or_path.endswith("go_emotions") or len(labels) >= 10 or "joy" in [l.lower() for l in labels]:
             grouped = _group_goemotions([l.lower() for l in labels], probs)
         elif set([l.lower() for l in labels]) >= {"positive", "negative", "neutral"}:
             grouped = _group_zh_sentiment([l.lower() for l in labels], probs)
         else:
-            # Fallback: Directly take the argmax and perform a closest-match mapping.
             raw_idx = int(torch.tensor(probs).argmax().item())
             raw_label = labels[raw_idx].lower()
             if raw_label in ("positive", "joy", "happiness", "amusement"):
@@ -620,6 +670,7 @@ def text_emotion(p: TextPayload):
             "used_model": mdl.name_or_path,
         }
 
+        # Write emotion into firebase if identifiers provided
         _write_emotion_to_firebase(p.uid, p.chatId, p.msgId, result)
         return result
     except Exception as e:
@@ -627,13 +678,17 @@ def text_emotion(p: TextPayload):
         raise HTTPException(status_code=500, detail=f"text inference error: {e}")
 
 
-# Chat SSE (Text Messages)
+# Chat SSE (Text messages) — this route now stores character profile AS-IS (no enrichment)
 @app.post("/chat/reply")
 def chat_reply(p: ChatPayload):
+    """
+    This endpoint receives a user message, optionally records sentiment and character settings,
+    then streams an assistant reply via SSE. Character background is saved as-is (no auto lookup).
+    """
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
     try:
-        # 1. Text Sentiment Analysis (Four-Category Aggregation) and Writing to Firebase
+        # 1) Text Sentiment Analysis and write to Firebase if identifiers available
         emo_result = None
         if p.uid and p.chatId and p.msgId:
             try:
@@ -643,17 +698,17 @@ def chat_reply(p: ChatPayload):
             except Exception:
                 log.exception("write text emotion failed")
 
-        # 2. Update Character Profile
-        if p.uid and p.aiName:
+        # 2) Save character profile EXACTLY as provided by client (NO enrichment)
+        if p.uid and p.chatId:
             try:
-                _upsert_user_character_profile(
+                _save_user_character_profile_simple(
                     uid=p.uid, char_id=p.chatId,
-                    ai_name=p.aiName, ai_gender=p.aiGender, ai_background=p.aiBackground,
+                    ai_name=p.aiName, ai_gender=p.aiGender, ai_background=p.aiBackground
                 )
             except Exception:
-                log.exception("upsert character profile failed")
+                log.exception("save_user_character_profile_simple failed")
 
-        # 3. Retrieve Character Data
+        # 3) Retrieve the most recent character data from Firebase for prompt building
         try:
             ref = db.reference(f"character/{p.uid}/{p.chatId}")
             profile = ref.get() or {}
@@ -661,9 +716,10 @@ def chat_reply(p: ChatPayload):
             log.exception("read character profile failed")
             profile = {}
 
+        # 4) Build roleplay system prompt using profile values verbatim
         sys_prompt = _build_roleplay_system_prompt(profile)
 
-        # 4. Auto-detect language → Control GPT response language
+        # 5) Auto-detect language to instruct the assistant
         try:
             lang = detect(p.message)
         except Exception:
@@ -673,12 +729,14 @@ def chat_reply(p: ChatPayload):
         else:
             lang_instr = "Please respond in English."
 
+        # 6) Compose messages for OpenAI
         messages = [{"role": "system", "content": sys_prompt + "\n" + lang_instr}]
         if p.history:
             messages.extend(p.history)
         messages.append({"role": "user", "content": p.message})
 
         headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        # Stream SSE using OpenAI deltas; Firebase writes happen inside _sse_stream_from_deltas
         return StreamingResponse(
             _sse_stream_from_deltas(_delta_iter_chat(messages), p.uid, p.chatId, p.msgId),
             media_type="text/event-stream",
@@ -689,21 +747,27 @@ def chat_reply(p: ChatPayload):
         raise HTTPException(status_code=500, detail=f"chat_reply error: {e}")
 
 
-# Voice: SER → GPT Response (Four-Category Aggregation) 
+# Audio processing route (SER -> GPT response) — unchanged except uses simple profile storage above
 @app.post("/audio/process")
 def audio_process(p: AudioPayload):
+    """
+    Process uploaded base64 wav:
+    1) Run audio emotion recognition and write emotion into Firebase
+    2) Try to use Responses API for direct audio processing; fallback to transcription + chat streaming
+    3) Stream assistant output via SSE, and write reply parts/full into Firebase
+    """
     if not _openai_client:
         raise HTTPException(status_code=500, detail="OpenAI client not initialized")
     try:
         _ensure_audio_emo()
         wav_path = _base64_wav_to_tmpfile(p.wav_base64)
 
-        # Use `soundfile` instead of `torchaudio.load`
+        # Use soundfile to read the wav to avoid torchaudio compatibility issues
         import soundfile as sf
-        wav, sr = sf.read(wav_path, dtype="float32")  # Specify float32 to prevent type incompatibility
-        wav = torch.tensor(wav).unsqueeze(0)  # Convert to tensor for easier model processing
+        wav, sr = sf.read(wav_path, dtype="float32")  # returns numpy array
+        wav = torch.tensor(wav).unsqueeze(0)  # convert to tensor
 
-        # Mono & Resampling
+        # Ensure mono + 16k sampling rate expected by extractor
         if wav.shape[0] > 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
         if sr != 16000:
@@ -711,7 +775,7 @@ def audio_process(p: AudioPayload):
             wav = torchaudio.functional.resample(wav, sr, 16000)
             sr = 16000
 
-        # 1. SER Voice Emotion Detection
+        # 1) SER voice emotion detection
         extractor = _AUDIO_EMO["extractor"]
         model: AutoModelForAudioClassification = _AUDIO_EMO["model"]
         labels: List[str] = _AUDIO_EMO["labels"]
@@ -732,7 +796,7 @@ def audio_process(p: AudioPayload):
             "used_model": AUDIO_EMO_MODEL,
         }
 
-        # 2. Write to Firebase
+        # 2) Write emotion to Firebase if identifiers present
         if p.uid and p.chatId and p.msgId:
             try:
                 ref = db.reference(f"chathistory/{p.uid}/{p.chatId}/messages/{p.msgId}")
@@ -740,10 +804,9 @@ def audio_process(p: AudioPayload):
             except Exception:
                 log.exception("write audio emotion failed")
 
-        # 3. Automatic Language Detection → Control Response Language
+        # 3) Try to detect user's language by attempting transcription first
         user_lang = "en"
         try:
-            # Attempt to transcribe and determine the language first
             with open(wav_path, "rb") as f:
                 transcript = _openai_client.audio.transcriptions.create(
                     model="gpt-4o-mini-transcribe", file=f
@@ -760,7 +823,7 @@ def audio_process(p: AudioPayload):
 
         headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
 
-        # Do not delete the file immediately
+        # 4) Stream the assistant reply using delta iterator for audio responses
         stream = _sse_stream_from_deltas(
             _delta_iter_audio_with_fallback(
                 wav_path,
@@ -771,7 +834,7 @@ def audio_process(p: AudioPayload):
             p.msgId,
         )
 
-        # Wrap using StreamingResponse and delete the file afterward
+        # Wrap stream with cleanup: delete temp wav after streaming
         def stream_with_cleanup():
             try:
                 for chunk in stream:
@@ -793,5 +856,4 @@ def audio_process(p: AudioPayload):
     except Exception as e:
         log.exception("audio_process error")
         raise HTTPException(status_code=500, detail=f"audio_process error: {e}")
-
 
